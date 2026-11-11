@@ -20,9 +20,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build-local.ps1 -Bundle
 When the managed endpoint is already in artifacts\trusttunnel_endpoint, scripts\build-dev-bundle.ps1
 builds the bundle without Docker: it rebuilds only the panel and packs the same archive.
 
-The Windows client is not built here: it lives in its own repository,
-https://github.com/divezh/netlane-app, where clients\windows\build.ps1 builds,
-signs and packages it.
+Clients are not built here: they live in https://github.com/divezh/netlane-windows
+and https://github.com/divezh/netlane-macos.
 #>
 param(
     [switch]$Panel,

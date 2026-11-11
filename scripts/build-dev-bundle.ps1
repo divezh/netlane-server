@@ -34,7 +34,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $artifacts = Join-Path $root 'artifacts'
-$repo = 'divezh/netlane'
+$repo = 'divezh/netlane-server'
 New-Item -ItemType Directory -Force -Path $artifacts | Out-Null
 
 function Find-Gh {

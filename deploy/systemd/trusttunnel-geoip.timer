@@ -1,6 +1,6 @@
 [Unit]
 Description=Netlane: monthly refresh of the GeoIP country database
-Documentation=https://github.com/divezh/netlane/blob/main/docs/GEOIP.md
+Documentation=https://github.com/divezh/netlane-server/blob/main/docs/GEOIP.md
 
 [Timer]
 # DB-IP publishes a new build on the first of each month.

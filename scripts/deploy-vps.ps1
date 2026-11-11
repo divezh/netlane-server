@@ -7,7 +7,7 @@ powershell -ExecutionPolicy Bypass -File scripts\deploy-vps.ps1 -Target root@203
 
 .DESCRIPTION
 Downloads the newest successful CI install bundle of main with the GitHub CLI (run
-"gh auth login" once; the repository is private) or uses -Bundle, checks the checksum and
+"gh auth login" once) or uses -Bundle, checks the checksum and
 DNS, uploads the bundle with the built-in OpenSSH client and runs the installer. The panel
 administrator password is generated on the VPS and shown once at the end.
 #>
@@ -21,7 +21,7 @@ param(
     [switch]$SkipDnsCheck
 )
 $ErrorActionPreference = 'Stop'
-$repo = 'divezh/netlane'
+$repo = 'divezh/netlane-server'
 $Domain = $Domain.ToLowerInvariant()
 if ($Target -notmatch '^[^@\s]+@[^@\s]+$') { throw 'Target must look like root@203.0.113.10.' }
 if ($Domain -notmatch '^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$') { throw "Invalid domain: $Domain" }

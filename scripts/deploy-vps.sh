@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Fast Netlane install on a fresh VPS, run from your own Linux/macOS/WSL machine.
 #   scripts/deploy-vps.sh root@203.0.113.10 vpn.example.com
-# Without --bundle the newest successful CI bundle of main is downloaded with the GitHub CLI
-# (gh auth login once; the repository is private).
+# Without --bundle the latest release is downloaded with the GitHub CLI
+# (gh auth login once).
 set -euo pipefail
 
 repo=divezh/netlane-server

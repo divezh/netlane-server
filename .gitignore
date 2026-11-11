@@ -41,5 +41,5 @@ runtime/
 artifacts/
 .cache/
 
-# Windows-клиент живёт в отдельном репозитории divezh/netlane-app
+# Клиенты живут в divezh/netlane-windows и divezh/netlane-macos
 clients/

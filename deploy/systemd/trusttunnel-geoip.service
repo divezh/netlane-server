@@ -1,6 +1,6 @@
 [Unit]
 Description=Netlane: refresh the GeoIP country database for client flags
-Documentation=https://github.com/divezh/netlane/blob/main/docs/GEOIP.md
+Documentation=https://github.com/divezh/netlane-server/blob/main/docs/GEOIP.md
 After=network-online.target
 Wants=network-online.target
 
