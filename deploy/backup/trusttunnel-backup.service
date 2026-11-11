@@ -1,0 +1,9 @@
+[Unit]
+Description=Netlane consistent backup (panel + managed endpoint)
+After=trusttunnel-managed.service trusttunnel-admin.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/trusttunnel-admin/bin/trusttunnel-backup
+Nice=10
+IOSchedulingClass=idle

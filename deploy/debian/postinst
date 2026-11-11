@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+if [ "$1" = configure ]; then
+  if ! getent passwd trusttunnel-admin >/dev/null; then
+    adduser --system --group --home /var/lib/trusttunnel-admin --no-create-home --shell /usr/sbin/nologin trusttunnel-admin
+  fi
+  install -d -m 0700 -o trusttunnel-admin -g trusttunnel-admin /etc/trusttunnel-admin /var/lib/trusttunnel-admin
+  # Configuration and startup are explicit installer steps; a .deb must never start an unconfigured API.
+  if [ -d /run/systemd/system ]; then systemctl daemon-reload; fi
+fi

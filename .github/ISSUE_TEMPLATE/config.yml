@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Документация
+    url: https://github.com/divezh/netlane-server/blob/main/docs/README.md
+    about: Установка, обновление, ноды и диагностика.
+  - name: Безопасность
+    url: https://github.com/divezh/netlane-server/blob/main/SECURITY.md
+    about: Как передать отчёт об уязвимости без раскрытия секретов.

@@ -1,0 +1,72 @@
+name: Release
+# Actions → Release → Run workflow (branch main, tag netlane-X.Y.Z), or push that tag.
+# It builds and tests exactly the commit it runs on, then publishes the install bundle with
+# generated notes. A hand run tags that commit when the tag does not exist yet, so the server
+# bundle's SOURCE_COMMIT is the tag commit and netlane-update can tell which release a server runs.
+# Servers update from the latest release of this repository, so publish only finished versions.
+# Clients live in divezh/netlane-windows and divezh/netlane-macos.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to publish, e.g. netlane-0.4.3
+        required: true
+permissions:
+  contents: write
+  actions: read
+concurrency:
+  group: release
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag
+        id: tag
+        run: |
+          set -euo pipefail
+          [[ $TAG =~ ^netlane-([0-9]+\.[0-9]+\.[0-9]+)$ ]] || { echo "::error::tag must look like netlane-X.Y.Z"; exit 1; }
+          echo "version=${BASH_REMATCH[1]}" >>"$GITHUB_OUTPUT"
+          if git rev-parse --verify -q "refs/tags/$TAG" >/dev/null && [ "$(git rev-parse "refs/tags/$TAG^{commit}")" != "$GITHUB_SHA" ]; then
+            echo "::error::$TAG already points to another commit; run Release on that commit or pick a new tag"; exit 1
+          fi
+  ci:
+    needs: check
+    uses: ./.github/workflows/ci.yml
+    with:
+      version: ${{ needs.check.outputs.version }}
+  publish:
+    needs: [ci]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: install-bundle-linux-amd64
+          path: dist
+      - name: Publish
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum -c ./*.sha256)
+          test "$(tar -xOzf dist/trusttunnel-dev.tar.gz ./SOURCE_COMMIT)" = "$GITHUB_SHA"
+          version=${TAG#netlane-}
+          title="Netlane $version - Server"
+          # Notes come from CHANGELOG.md: the panel shows their bullet points as "Что нового".
+          awk -v v="$version" '$0 ~ "^## " {on = ($2 == v); next} on' CHANGELOG.md >notes.md
+          test -s notes.md || { echo "::error::CHANGELOG.md has no section ## $version"; exit 1; }
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --title "$title" --notes-file notes.md --latest
+          else
+            gh release create "$TAG" dist/* --title "$title" --notes-file notes.md --latest --target "$GITHUB_SHA"
+          fi

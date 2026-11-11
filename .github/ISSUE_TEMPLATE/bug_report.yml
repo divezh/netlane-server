@@ -1,0 +1,48 @@
+name: Ошибка
+description: Воспроизводимая проблема в панели или установщике.
+title: "[Bug]: "
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Компонент
+      options:
+        - Панель и API
+        - Установка или обновление
+        - Ноды и синхронизация
+        - Документация
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Версия или коммит
+      placeholder: "0.4.9 / SOURCE_COMMIT"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: ОС и окружение
+      placeholder: "Ubuntu 24.04 x64"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Как воспроизвести
+      description: Шаги, ожидаемый результат и что произошло фактически.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Обезличенный журнал или снимок экрана
+      description: Удалите пароли, токены, ссылки подписок/приглашений и данные пользователей.
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Данные отчёта
+      options:
+        - label: В отчёте нет рабочих секретов и приватных ключей.
+          required: true

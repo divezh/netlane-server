@@ -1,0 +1,15 @@
+:root{--ink:#1f2328;--muted:#5d646d;--line:#e4e2dc;--bg:#faf8f4;--accent:#8a5a2b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.65 Georgia,"Times New Roman",serif}
+a{color:var(--accent)}
+.top{display:flex;justify-content:space-between;align-items:baseline;max-width:720px;margin:0 auto;padding:28px 20px 18px;border-bottom:1px solid var(--line)}
+.brand{font:600 20px/1 system-ui,sans-serif;color:var(--ink);text-decoration:none;letter-spacing:.02em}
+nav a{margin-left:18px;font:15px system-ui,sans-serif;color:var(--muted);text-decoration:none}
+nav a:hover{color:var(--ink)}
+main{max-width:720px;margin:0 auto;padding:12px 20px 40px}
+.intro h1{font-size:32px;line-height:1.2;margin:28px 0 8px}
+.intro p{color:var(--muted)}
+article{padding:22px 0;border-bottom:1px solid var(--line)}
+article h2{font-size:22px;margin:4px 0 6px}
+.date{margin:0;font:13px system-ui,sans-serif;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+footer{max-width:720px;margin:0 auto;padding:24px 20px 48px;font:13px system-ui,sans-serif;color:var(--muted)}

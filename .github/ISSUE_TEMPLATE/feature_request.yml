@@ -1,0 +1,23 @@
+name: Предложение
+description: Улучшение приложения, панели или эксплуатации.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую задачу нужно решить
+      description: Опишите конкретный сценарий и неудобство текущего поведения.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Желаемое поведение
+      description: Что должен увидеть или сделать пользователь; можно приложить эскиз.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Дополнительный контекст
+      description: Возможные варианты, ограничения и совместимость.

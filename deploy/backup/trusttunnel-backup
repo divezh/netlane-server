@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Consistent backup of the panel and the managed endpoint.
+# Both services are stopped for the copy (usually under a second): the quota journal and
+# managed state must be saved together (docs/QUOTAS.md). Connected VPN clients reconnect.
+# The archive contains the VPN password encryption key and TLS keys: root only, keep it
+# off public storage, and copy it off the VPS encrypted.
+set -euo pipefail
+umask 077
+((EUID == 0)) || { echo 'Root is required.' >&2; exit 1; }
+dest=${TT_BACKUP_DIR:-/var/backups/trusttunnel}
+keep=${TT_BACKUP_KEEP:-14}
+[[ $keep =~ ^[1-9][0-9]*$ ]] || { echo 'TT_BACKUP_KEEP must be a positive number.' >&2; exit 2; }
+install -d -m 0700 "$dest"
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+partial="$dest/.backup-$stamp.tar.gz.partial"
+paths=()
+for path in etc/trusttunnel etc/trusttunnel-admin var/lib/trusttunnel var/lib/trusttunnel-admin \
+  etc/systemd/system/trusttunnel-managed.service etc/systemd/system/trusttunnel-admin.service etc/systemd/system/trusttunnel-node.service etc/letsencrypt; do
+  [[ -e /$path ]] && paths+=("$path")
+done
+((${#paths[@]})) || { echo 'Nothing to back up.' >&2; exit 1; }
+# Restart exactly what was running before, also when tar fails.
+running=()
+for unit in trusttunnel-managed trusttunnel-admin trusttunnel-node; do
+  systemctl is-active --quiet "$unit" && running+=("$unit")
+done
+restore() {
+  rm -f -- "$partial"
+  ((${#running[@]})) && systemctl start "${running[@]}"
+}
+trap restore EXIT
+((${#running[@]})) && systemctl stop "${running[@]}"
+tar -czf "$partial" -C / --exclude=var/lib/trusttunnel/managed.usage.lock "${paths[@]}"
+mv -- "$partial" "$dest/backup-$stamp.tar.gz"
+trap - EXIT
+((${#running[@]})) && systemctl start "${running[@]}"
+# Keep the newest $keep archives.
+find "$dest" -maxdepth 1 -type f -name 'backup-*.tar.gz' -printf '%T@ %p\n' | sort -rn | tail -n +$((keep + 1)) | cut -d' ' -f2- | xargs -r rm -f --
+echo "Backup written: $dest/backup-$stamp.tar.gz ($(du -h "$dest/backup-$stamp.tar.gz" | cut -f1))"

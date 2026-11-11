@@ -1,0 +1,76 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      version:
+        description: Release version recorded in the panel build
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+jobs:
+  go:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: bash scripts/test-installer.sh
+      - name: Test interactive setup and actual server binary
+        run: |
+          go build -o artifacts/trusttunnel-admin ./cmd/trusttunnel-admin
+          python3 scripts/test-wizard.py artifacts/trusttunnel-admin
+  upstream:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Fetch pinned upstream and apply patch
+        run: |
+          git clone https://github.com/TrustTunnel/TrustTunnel.git research/upstream
+          git -C research/upstream checkout fab5b8353a19332f935fa30869307d37d4a898d1
+          git -C research/upstream apply ../../upstream/patches/0001-reload-credentials.patch
+          git -C research/upstream apply ../../upstream/patches/0002-managed-control-and-traffic.patch
+          git -C research/upstream apply ../../upstream/patches/0003-managed-expiry.patch
+          git -C research/upstream apply ../../upstream/patches/0004-durable-monthly-quota.patch
+          git -C research/upstream apply ../../upstream/patches/0005-remove-managed-users.patch
+      - uses: actions/cache@v4
+        with:
+          path: |
+            research/upstream/target
+            .cache/cargo-registry
+          key: ${{ runner.os }}-rust-1.95-${{ hashFiles('upstream/patches/**') }}
+          restore-keys: ${{ runner.os }}-rust-1.95-
+      - run: docker build -t tt-upstream-test -f deploy/ci/upstream.Dockerfile deploy/ci
+      - name: Build and test managed endpoint
+        run: |
+          mkdir -p artifacts .cache/cargo-registry
+          docker run --rm -v "$PWD/research/upstream:/src" -v "$PWD/.cache/cargo-registry:/usr/local/cargo/registry" -v "$PWD/artifacts:/out" tt-upstream-test bash -c 'cargo fmt --all -- --check && cargo clippy --locked -- -D warnings && cargo test --locked -p trusttunnel --lib && cargo test --locked -p trusttunnel --test managed && cargo test --locked -p trusttunnel_endpoint --bin trusttunnel_endpoint && cargo build --release --locked -p trusttunnel_endpoint && cp target/release/trusttunnel_endpoint /out/trusttunnel_endpoint'
+      - name: Test panel and actual managed endpoint together
+        run: |
+          CGO_ENABLED=0 go build -o artifacts/trusttunnel-admin ./cmd/trusttunnel-admin
+          python3 scripts/test-managed-endpoint.py artifacts/trusttunnel_endpoint artifacts/trusttunnel-admin
+      - name: Build complete Linux installation bundle
+        env:
+          NETLANE_VERSION: ${{ inputs.version }}
+        run: bash scripts/build-dev-bundle.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: install-bundle-linux-amd64
+          path: |
+            artifacts/trusttunnel-dev.tar.gz
+            artifacts/trusttunnel-dev.tar.gz.sha256
+          retention-days: 30

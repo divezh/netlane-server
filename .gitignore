@@ -1,0 +1,45 @@
+# Dependencies and build output
+node_modules/
+dist/
+build/
+coverage/
+__pycache__/
+*.py[cod]
+
+# Local credentials and runtime data
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.sqlite*
+*.db
+credentials.toml
+config.json
+*.sqlite-wal
+*.sqlite-shm
+managed.json
+*.usage.jsonl
+*.usage.lock
+
+# Local research and generated inspection metadata
+research/
+.taste-skill/
+design/previews/**/report.json
+/render.png
+
+# Editor and OS metadata
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+*.log
+.tools/
+runtime/
+artifacts/
+.cache/
+
+# Windows-клиент живёт в отдельном репозитории divezh/netlane-app
+clients/

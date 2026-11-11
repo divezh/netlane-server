@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Netlane — новая таблица пользователей</title>
+<link rel="stylesheet" href="../web/app.css">
+<style>
+/* Стили только для макета: рамка, подписи блоков и то, чего в панели пока нет. */
+body{margin:0;background:var(--ground);color:var(--text);font-family:'IBM Plex Sans',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{padding:28px 32px 60px;max-width:1180px}
+h1{font-size:21px;font-weight:600;margin:0 0 6px}
+.lead{color:var(--muted);font-size:13px;margin:0 0 26px}
+.block{margin-bottom:36px}
+.block>h2{font-size:15px;font-weight:600;margin:0 0 3px}
+.block>p{color:var(--muted);font-size:12.5px;margin:0 0 14px}
+.tag{display:inline-block;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;padding:2px 7px;border-radius:5px;margin-bottom:7px}
+.tag.before{color:var(--muted);border:1px solid var(--border)}
+.tag.after{color:var(--accent);border:1px solid #1c4e57}
+.frame{border:1px solid var(--border);border-radius:10px;padding:16px 18px;background:var(--surface)}
+.stack{display:grid;gap:14px}
+.frame small{display:block}
+.open-space{padding-bottom:190px}
+
+/* Фильтр: кнопка со счётчиком и панель — тот же приём, что у переключателя локации. */
+.filter-picker{position:relative}
+.filter-button{display:inline-flex;align-items:center;gap:9px;min-height:34px;padding:6px 10px 6px 12px;background:var(--input);color:var(--text);border:1px solid var(--edge);border-radius:8px;font-family:inherit;font-size:13.5px;font-weight:500;cursor:pointer}
+.filter-button:hover{background:#242831}
+.filter-button .count{margin-left:2px;padding:1px 7px;border-radius:20px;background:rgba(34,211,230,.12);color:var(--accent);font-size:12px;font-variant-numeric:tabular-nums}
+.filter-button .chev{color:var(--muted)}
+.filter-panel{position:absolute;top:calc(100% + 6px);left:0;z-index:5;min-width:272px;padding:5px;background:var(--surface);border:1px solid var(--edge);border-radius:10px;box-shadow:0 16px 40px -12px rgba(0,0,0,.75)}
+.filter-row{display:flex;align-items:center;gap:10px;width:100%;padding:8px 10px;background:transparent;border:0;border-radius:6px;color:var(--text);font-family:inherit;font-size:13.5px;text-align:left;cursor:pointer}
+.filter-row+.filter-row{margin-top:4px}
+.filter-row:hover{background:#242831}
+.filter-row[aria-selected=true]{background:var(--selected)}
+.filter-row .amount{margin-left:auto;color:var(--muted);font-size:12px;font-variant-numeric:tabular-nums}
+.filter-row .check{color:var(--accent);opacity:0}
+.filter-row[aria-selected=true] .check{opacity:1}
+.filter-row .dot{width:8px;height:8px;border-radius:50%;flex:none}
+#user-count{font-variant-numeric:tabular-nums}
+#user-count .reset{margin-left:8px;color:var(--accent);cursor:pointer}
+
+/* Статус: светящийся индикатор плюс подпись. */
+.status{display:inline-flex;align-items:center;gap:8px;white-space:nowrap}
+.status .dot{width:9px;height:9px;border-radius:50%;flex:none}
+.status .label{font-size:13px}
+.dot-online{background:#8dcea9;box-shadow:0 0 0 3px rgba(141,206,169,.18),0 0 9px rgba(141,206,169,.65)}
+.dot-offline{background:#ee8d82;box-shadow:0 0 0 3px rgba(238,141,130,.14)}
+.dot-never{background:#5c636e}
+.dot-expired{background:#e7be6b;box-shadow:0 0 0 3px rgba(231,190,107,.16),0 0 9px rgba(231,190,107,.5)}
+.dot-exhausted{background:#ee8d82;box-shadow:0 0 0 3px rgba(238,141,130,.14)}
+.color-online{color:#8dcea9}.color-offline{color:#ee8d82}.color-never{color:var(--muted)}.color-expired{color:#e7be6b}
+
+/* Расход: сумма, полоса и лимит — как на образце. */
+.usage{min-width:168px}
+.usage-top{display:flex;align-items:baseline;gap:8px;font-variant-numeric:tabular-nums}
+.usage-top .used{font-weight:500}
+.usage-top .pct{margin-left:auto;color:var(--muted);font-size:12px}
+.usage-bar{height:6px;margin:5px 0 4px;border-radius:3px;background:var(--border);overflow:hidden}
+.usage-bar i{display:block;height:100%;border-radius:3px;background:var(--accent)}
+.usage-bar i.warn{background:#e7be6b}
+.usage-bar i.full{background:#ee8d82}
+.usage-limit{color:var(--muted);font-size:12px}
+
+/* Подключение: флаг и адрес. */
+.connection{display:inline-flex;align-items:center;gap:8px}
+.connection .flag{width:20px;height:15px;border-radius:2px;flex:none;box-shadow:0 0 0 1px rgba(255,255,255,.1)}
+.connection .ip{font-variant-numeric:tabular-nums}
+
+/* Действия: профиль и «⋯» с меню. */
+.row-actions{display:flex;gap:6px;align-items:center;justify-content:flex-end}
+.row-actions .more{padding:4px 9px;font-weight:600;letter-spacing:1px}
+.menu{position:relative}
+.menu-panel{position:absolute;top:calc(100% + 5px);right:0;z-index:6;min-width:214px;padding:5px;background:var(--surface);border:1px solid var(--edge);border-radius:10px;box-shadow:0 16px 40px -12px rgba(0,0,0,.75)}
+.menu-panel button{display:block;width:100%;padding:8px 10px;background:transparent;border:0;border-radius:6px;color:var(--text);font:400 13.5px inherit;text-align:left;cursor:pointer}
+.menu-panel button:hover{background:#242831}
+.menu-panel button[disabled]{color:var(--muted);cursor:default}
+.menu-panel button[disabled]:hover{background:transparent}
+
+/* Таблица: наведение строки. */
+.user-table tbody tr{transition:background .12s ease-out}
+.user-table tbody tr:hover{background:#1a1d22}
+
+.legend{display:flex;gap:22px;flex-wrap:wrap;margin-top:14px;color:var(--muted);font-size:12.5px}
+.legend span.item{display:inline-flex;align-items:center;gap:7px}
+.notes{margin-top:12px;color:var(--muted);font-size:12.5px;line-height:1.6}
+.notes code{color:var(--text)}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Пользователи: новая таблица</h1>
+<p class="lead">Порядок и содержимое колонок — по вашей заявке, плюс фильтр со счётчиками. Стили настоящие, из <code>web/app.css</code>.</p>
+
+<!-- 1. Фильтр -->
+<section class="block">
+  <h2>1. Фильтр: из системного списка — в свой, со счётчиками</h2>
+  <p>К варианту добавились состояния из новой колонки «Статус»: «Не в сети» и «Ни разу не подключался». Числа в пунктах считаются по вашим пользователям, поэтому видно, у кого проблемы, без переключения вариантов.</p>
+  <div class="stack">
+    <div>
+      <span class="tag before">Сейчас</span>
+      <div class="frame">
+        <div class="toolbar">
+          <label><input type="search" placeholder="Поиск по имени" aria-label="Поиск по имени" style="width:340px"></label>
+          <select aria-label="Доступ" style="width:auto;min-width:170px"><option>Все пользователи</option><option>В сети</option><option>Разрешён доступ</option><option>Отключены</option><option>Срок истёк</option><option>Квота исчерпана</option></select>
+          <p id="user-count" style="margin-left:auto">1 из 1</p>
+        </div>
+      </div>
+    </div>
+    <div>
+      <span class="tag after">Предлагаю</span>
+      <div class="frame open-space">
+        <div class="toolbar">
+          <label><input type="search" placeholder="Поиск по имени" aria-label="Поиск по имени" style="width:340px"></label>
+          <div class="filter-picker">
+            <button type="button" class="filter-button" aria-expanded="true">В сети<span class="count">2</span><svg class="chev" width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 4.5 6 8l3.5-3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+            <div class="filter-panel" role="listbox" aria-label="Фильтр по состоянию">
+              <button class="filter-row" role="option" aria-selected="false"><span>Все пользователи</span><span class="amount">6</span><svg class="check" width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.5 5.8 10 11 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+              <button class="filter-row" role="option" aria-selected="true"><span class="dot dot-online"></span><span>В сети</span><span class="amount">2</span><svg class="check" width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.5 5.8 10 11 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+              <button class="filter-row" role="option" aria-selected="false"><span class="dot dot-offline"></span><span>Не в сети</span><span class="amount">1</span><svg class="check" width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.5 5.8 10 11 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+              <button class="filter-row" role="option" aria-selected="false"><span class="dot dot-never"></span><span>Ни разу не подключался</span><span class="amount">1</span><svg class="check" width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.5 5.8 10 11 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+              <button class="filter-row" role="option" aria-selected="false"><span class="dot dot-expired"></span><span>Срок истёк</span><span class="amount">1</span><svg class="check" width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.5 5.8 10 11 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+              <button class="filter-row" role="option" aria-selected="false"><span class="dot dot-never"></span><span>Отключены</span><span class="amount">1</span><svg class="check" width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.5 5.8 10 11 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+              <button class="filter-row" role="option" aria-selected="false"><span class="dot dot-exhausted"></span><span>Квота исчерпана</span><span class="amount">0</span><svg class="check" width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.5 5.8 10 11 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+            </div>
+          </div>
+          <p id="user-count" style="margin-left:auto">2 пользователя из 6<span class="reset">Сбросить</span></p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 2. Таблица -->
+<section class="block">
+  <h2>2. Таблица: порядок и содержимое колонок</h2>
+  <p>Порядок: Пользователь, Статус, Расход, Подключение, Действия. «Загрузка / отдача» и «Локации» из таблицы уходят — скорости видны в профиле, а доступность локаций там же; если нужно, верну их в подсказку к имени.</p>
+  <div class="stack">
+    <div>
+      <span class="tag before">Сейчас</span>
+      <div class="frame">
+        <div class="table-wrap"><table class="user-table">
+          <thead><tr><th>Пользователь</th><th>Доступ</th><th class="num">Загрузка / отдача</th><th>Подключение</th><th class="num">Локации</th><th class="num">Расход</th><th class="num">Действия</th></tr></thead>
+          <tbody><tr>
+            <td class="user-name"><span class="user-identity"><span class="user-online-dot" role="img" aria-label="В сети" title="В сети"></span><span>User</span></span></td>
+            <td class="ok" data-label="Доступ">Доступ разрешён</td>
+            <td class="num" data-label="Загрузка / отдача"><span class="user-speed"><span aria-label="Загрузка">↓</span> Без лимита</span><span class="user-speed"><span aria-label="Отдача">↑</span> Без лимита</span></td>
+            <td data-label="Подключение"><span class="ok">В сети</span><small>203.0.113.10 · 2 транспортных соединения</small></td>
+            <td class="num" data-label="Локации">2 из 2</td>
+            <td class="num" data-label="Расход">1,3 ГиБ<small>За месяц</small></td>
+            <td><div class="actions"><button>Изменить</button><button>Профиль</button><button>Отключить соединения</button></div></td>
+          </tr></tbody>
+        </table></div>
+      </div>
+    </div>
+
+    <div>
+      <span class="tag after">Предлагаю</span>
+      <div class="frame">
+        <div class="table-wrap"><table class="user-table">
+          <thead><tr>
+            <th>Пользователь</th>
+            <th>Статус</th>
+            <th class="num">Расход</th>
+            <th>Подключение</th>
+            <th class="num">Действия</th>
+          </tr></thead>
+          <tbody>
+            <tr>
+              <td class="user-name">User<small>До 12.12.2026, 23:00</small></td>
+              <td data-label="Статус"><span class="status"><span class="dot dot-online"></span><span class="label color-online">В сети</span></span></td>
+              <td class="num" data-label="Расход"><div class="usage">
+                <div class="usage-top"><span class="used">1,3 ГиБ</span><span class="pct">26%</span></div>
+                <div class="usage-bar"><i style="width:26%"></i></div>
+                <div class="usage-limit">из 5 ГиБ</div>
+              </div></td>
+              <td data-label="Подключение"><span class="connection"><img class="flag" src="flags/pl.40.png" alt="Польша" width="20" height="15"><span class="ip">203.0.113.10</span></span></td>
+              <td><div class="row-actions"><button>Профиль</button>
+                <div class="menu"><button class="more" aria-expanded="true" aria-label="Ещё действия">⋯</button>
+                  <div class="menu-panel" role="menu">
+                    <button role="menuitem">Изменить</button>
+                    <button role="menuitem">Отключить соединения</button>
+                    <button role="menuitem">Скопировать ссылку подписки</button>
+                  </div>
+                </div>
+              </div></td>
+            </tr>
+            <tr>
+              <td class="user-name">Anna</td>
+              <td data-label="Статус"><span class="status"><span class="dot dot-online"></span><span class="label color-online">В сети</span></span></td>
+              <td class="num" data-label="Расход"><div class="usage">
+                <div class="usage-top"><span class="used">41,2 ГиБ</span><span class="pct">82%</span></div>
+                <div class="usage-bar"><i class="warn" style="width:82%"></i></div>
+                <div class="usage-limit">из 50 ГиБ</div>
+              </div></td>
+              <td data-label="Подключение"><span class="connection"><img class="flag" src="flags/nl.40.png" alt="Нидерланды" width="20" height="15"><span class="ip">203.0.113.24</span></span></td>
+              <td><div class="row-actions"><button>Профиль</button><div class="menu"><button class="more" aria-expanded="false" aria-label="Ещё действия">⋯</button></div></div></td>
+            </tr>
+            <tr>
+              <td class="user-name">Peter</td>
+              <td data-label="Статус"><span class="status"><span class="dot dot-offline"></span><span class="label color-offline">Не в сети</span></span></td>
+              <td class="num" data-label="Расход"><div class="usage">
+                <div class="usage-top"><span class="used">640 МиБ</span><span class="pct">∞</span></div>
+                <div class="usage-bar"><i style="width:0"></i></div>
+                <div class="usage-limit">без лимита</div>
+              </div></td>
+              <td data-label="Подключение"><span class="connection"><img class="flag" src="flags/de.40.png" alt="Германия" width="20" height="15"><span class="ip" style="color:var(--muted)">203.0.113.31</span></span><small>был в сети 07.11, 21:40</small></td>
+              <td><div class="row-actions"><button>Профиль</button><div class="menu"><button class="more" aria-expanded="false" aria-label="Ещё действия">⋯</button></div></div></td>
+            </tr>
+            <tr>
+              <td class="user-name">Test</td>
+              <td data-label="Статус"><span class="status"><span class="dot dot-expired"></span><span class="label color-expired">Срок истёк</span></span></td>
+              <td class="num" data-label="Расход"><div class="usage">
+                <div class="usage-top"><span class="used">5,0 ГиБ</span><span class="pct">100%</span></div>
+                <div class="usage-bar"><i class="full" style="width:100%"></i></div>
+                <div class="usage-limit">из 5 ГиБ</div>
+              </div></td>
+              <td data-label="Подключение"><span class="connection"><img class="flag" src="flags/fr.40.png" alt="Франция" width="20" height="15"><span class="ip" style="color:var(--muted)">203.0.113.44</span></span><small>был в сети 01.11, 09:12</small></td>
+              <td><div class="row-actions"><button>Профиль</button><div class="menu"><button class="more" aria-expanded="false" aria-label="Ещё действия">⋯</button></div></div></td>
+            </tr>
+            <tr>
+              <td class="user-name">Guest</td>
+              <td data-label="Статус"><span class="status"><span class="dot dot-never"></span><span class="label color-never">Отключён</span></span></td>
+              <td class="num" data-label="Расход"><div class="usage">
+                <div class="usage-top"><span class="used">12 МиБ</span><span class="pct">∞</span></div>
+                <div class="usage-bar"><i style="width:0"></i></div>
+                <div class="usage-limit">без лимита</div>
+              </div></td>
+              <td data-label="Подключение"><span class="color-never">—</span></td>
+              <td><div class="row-actions"><button>Профиль</button><div class="menu"><button class="more" aria-expanded="false" aria-label="Ещё действия">⋯</button></div></div></td>
+            </tr>
+            <tr>
+              <td class="user-name">New</td>
+              <td data-label="Статус"><span class="status"><span class="dot dot-never"></span><span class="label color-never">Ни разу не подключался</span></span></td>
+              <td class="num" data-label="Расход"><div class="usage">
+                <div class="usage-top"><span class="used">0 Б</span><span class="pct">∞</span></div>
+                <div class="usage-bar"><i style="width:0"></i></div>
+                <div class="usage-limit">без лимита</div>
+              </div></td>
+              <td data-label="Подключение"><span class="color-never">—</span></td>
+              <td><div class="row-actions"><button>Профиль</button><div class="menu"><button class="more" aria-expanded="false" aria-label="Ещё действия">⋯</button></div></div></td>
+            </tr>
+          </tbody>
+        </table></div>
+        <div class="legend">
+          <span class="item"><span class="dot dot-online" style="width:9px;height:9px;border-radius:50%"></span>в сети</span>
+          <span class="item"><span class="dot dot-offline" style="width:9px;height:9px;border-radius:50%"></span>не в сети</span>
+          <span class="item"><span class="dot dot-never" style="width:9px;height:9px;border-radius:50%"></span>ни разу не подключался или доступ отключён</span>
+          <span class="item"><span class="dot dot-expired" style="width:9px;height:9px;border-radius:50%"></span>срок истёк</span>
+        </div>
+        <div class="notes">
+          <p>Полоса расхода: циан до 80 %, жёлтая с 80 %, красная при исчерпанной квоте. Без лимита полоса пустая, справа стоит «∞» — как на вашем образце.</p>
+          <p>Статусов у нас больше, чем четыре: у пользователя бывает ещё «Отключён» и «Квота исчерпана». Их показываю серым и красным с подписью, чтобы состояние не потерялось.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 3. Откуда берётся флаг -->
+<section class="block">
+  <h2>3. Откуда берётся флаг</h2>
+  <p>Флаг — настоящая картинка, а не эмодзи: на Windows эмодзи-флаги рисуются буквами «PL», поэтому берём готовый набор изображений.</p>
+  <div class="frame">
+    <div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap">
+      <span><img class="flag" src="flags/pl.40.png" alt="Польша" width="20" height="15"></span>
+      <span><img class="flag" src="flags/nl.40.png" alt="Нидерланды" width="20" height="15"></span>
+      <span><img class="flag" src="flags/de.40.png" alt="Германия" width="20" height="15"></span>
+      <span><img class="flag" src="flags/gb.40.png" alt="Великобритания" width="20" height="15"></span>
+      <span><img class="flag" src="flags/us.40.png" alt="США" width="20" height="15"></span>
+      <span style="color:var(--muted);font-size:12.5px">PNG из flag-icons (MIT), в двух размерах — тот же набор уже лежит в клиенте: 500 файлов на 159 КБ</span>
+    </div>
+    <div class="notes">
+      <p><strong>Страну клиента определяет GeoIP по его адресу</strong> — на сервере, а не в браузере: панель внешних запросов не делает, CSP это запрещает. Базу кладём рядом с панелью и обновляем по расписанию.</p>
+      <p><strong>Когда адреса нет:</strong> у тех, кто не в сети, флаг по последнему адресу — приглушённый; у тех, кто не подключался ни разу, прочерк. Страна сервера остаётся запасным вариантом, если база не узнала адрес.</p>
+    </div>
+  </div>
+</section>
+</div>
+</body>
+</html>

@@ -1,0 +1,23 @@
+# Bans repeated failed panel logins on 8443/TCP. The panel itself also allows
+# only 5 attempts per minute per IP; this jail stops slow, sustained guessing.
+[trusttunnel-admin]
+enabled = true
+backend = systemd
+filter = trusttunnel-admin
+port = 8443
+protocol = tcp
+maxretry = 5
+findtime = 10m
+bantime = 1h
+bantime.increment = true
+bantime.maxtime = 1w
+
+# SSH: same policy as the panel; the distribution default bans for only 10 minutes.
+[sshd]
+enabled = true
+backend = systemd
+maxretry = 5
+findtime = 10m
+bantime = 1h
+bantime.increment = true
+bantime.maxtime = 1w

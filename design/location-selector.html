@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Netlane — селектор локации: варианты</title>
+<style>
+@font-face{font-family:'IBM Plex Sans';font-style:normal;font-weight:400;font-display:swap;src:url('../web/fonts/ibm-plex-sans-cyrillic-400-normal.woff2') format('woff2')}
+@font-face{font-family:'IBM Plex Sans';font-style:normal;font-weight:500;font-display:swap;src:url('../web/fonts/ibm-plex-sans-cyrillic-500-normal.woff2') format('woff2')}
+@font-face{font-family:'IBM Plex Sans';font-style:normal;font-weight:600;font-display:swap;src:url('../web/fonts/ibm-plex-sans-cyrillic-600-normal.woff2') format('woff2')}
+
+:root{
+  --ground:#0d0f12;--surface:#15171b;--border:#292d34;--edge:#343943;
+  --muted:#a3a8b3;--text:#f1f2f5;--accent:#22d3e6;--selected:#24282f;--input:#191c22;
+  --hover:#242831;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--text);
+  font:400 14px/1.5 'IBM Plex Sans',system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased;padding:28px 32px 40px;
+  font-variant-numeric:tabular-nums}
+h1{font-size:20px;font-weight:600;margin:0 0 6px}
+.lead{color:var(--muted);font-size:13px;margin:0 0 26px}
+
+.variant{margin-bottom:30px}
+.vhead{display:flex;align-items:baseline;gap:10px;margin-bottom:4px}
+.vnum{font-size:11px;font-weight:600;color:var(--accent);letter-spacing:.08em;text-transform:uppercase}
+.vname{font-size:15px;font-weight:600}
+.vnote{color:var(--muted);font-size:12.5px;margin:0 0 14px}
+.tag{font-size:11px;color:var(--muted);border:1px solid var(--border);border-radius:5px;padding:1px 6px}
+.tag.rec{color:var(--accent);border-color:#1c4e57}
+
+/* строка как на странице «Обзор» */
+.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:12px;
+  background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px}
+.tb-label{color:var(--muted);font-size:13px}
+.tb-spacer{flex:1}
+.hint{color:var(--muted);font-size:12px}
+
+/* переключатель периода — как в панели, для сравнения */
+.periods{display:inline-flex;background:var(--input);border:1px solid var(--edge);border-radius:8px;padding:2px;gap:2px}
+.periods button{border:0;background:transparent;color:var(--muted);font:500 12px 'IBM Plex Sans',sans-serif;
+  min-width:49px;min-height:30px;padding:5px 10px;border-radius:6px;cursor:pointer}
+.periods button[aria-pressed=true]{background:var(--accent);color:#082126}
+
+/* ── сейчас: нативный select ─────────────────────────── */
+.native{display:flex;align-items:center;gap:10px}
+.native select{appearance:none;-webkit-appearance:none;background:var(--input);color:var(--text);
+  border:1px solid var(--edge);border-radius:8px;padding:6px 30px 6px 10px;font:400 14px 'IBM Plex Sans',sans-serif;
+  min-height:34px;background-image:linear-gradient(45deg,transparent 50%,var(--accent) 50%),linear-gradient(135deg,var(--accent) 50%,transparent 50%);
+  background-position:calc(100% - 15px) 15px,calc(100% - 10px) 15px;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+
+/* ── 1. табы локаций ─────────────────────────────────── */
+.loc-tabs{display:inline-flex;background:var(--input);border:1px solid var(--edge);border-radius:8px;padding:2px;gap:2px;min-width:0}
+.loc-tabs button{display:inline-flex;align-items:center;gap:7px;border:1px solid transparent;background:transparent;
+  color:var(--muted);font:500 13px 'IBM Plex Sans',sans-serif;padding:6px 11px;border-radius:6px;cursor:pointer;min-height:32px;white-space:nowrap}
+.loc-tabs button:hover{background:var(--hover);color:var(--text)}
+.loc-tabs button[aria-selected=true]{background:var(--selected);border-color:var(--edge);color:var(--text)}
+.loc-tabs .role{color:var(--muted);font-weight:400;font-size:12px}
+.loc-tabs button[aria-selected=true] .role{color:#8f97a3}
+
+/* ── 2. кнопка + панель ──────────────────────────────── */
+.loc-wrap{position:relative;display:inline-block}
+.loc-btn{display:inline-flex;align-items:center;gap:9px;background:var(--input);color:var(--text);
+  border:1px solid var(--edge);border-radius:8px;padding:6px 10px 6px 11px;min-height:34px;cursor:pointer;
+  font:500 13.5px 'IBM Plex Sans',sans-serif}
+.loc-btn:hover{background:var(--hover);border-color:#3f4650}
+.loc-btn .role{color:var(--muted);font-weight:400;font-size:12px}
+.loc-btn .chev{margin-left:2px;color:var(--muted);transition:transform .16s cubic-bezier(.2,0,0,1)}
+.loc-wrap[data-open=true] .loc-btn .chev{transform:rotate(180deg)}
+.loc-panel{position:absolute;top:calc(100% + 6px);left:0;z-index:5;min-width:268px;max-height:320px;overflow-y:auto;
+  background:#1b1e24;border:1px solid #333941;border-radius:10px;padding:5px;
+  box-shadow:0 12px 32px -8px rgba(0,0,0,.65),0 2px 6px rgba(0,0,0,.4)}
+.loc-panel .phead{padding:7px 10px 6px;color:var(--muted);font-size:11px;font-weight:500;letter-spacing:.06em;text-transform:uppercase}
+.loc-row{display:flex;align-items:center;gap:10px;width:100%;background:transparent;border:0;color:var(--text);
+  font:400 13.5px 'IBM Plex Sans',sans-serif;padding:8px 10px;border-radius:6px;cursor:pointer;text-align:left}
+.loc-row:hover{background:var(--hover)}
+.loc-row[aria-selected=true]{background:var(--selected)}
+.loc-row .rmeta{margin-left:auto;color:var(--muted);font-size:12px;display:flex;align-items:center;gap:8px}
+.loc-row .check{color:var(--accent);opacity:0}
+.loc-row[aria-selected=true] .check{opacity:1}
+.pfoot{border-top:1px solid var(--border);margin-top:5px;padding:7px 10px 4px;color:var(--muted);font-size:11.5px}
+
+/* ── 3. лента локаций ────────────────────────────────── */
+.strip{display:flex;gap:8px;overflow-x:auto;padding-bottom:2px;max-width:100%}
+.lcard{display:flex;flex-direction:column;gap:3px;min-width:150px;
+  background:var(--input);border:1px solid var(--border);border-radius:8px;padding:9px 12px;cursor:pointer;text-align:left}
+.lcard:hover{background:var(--hover);border-color:var(--edge)}
+.lcard[aria-pressed=true]{background:var(--selected);border-color:var(--accent)}
+.lcard .top{display:flex;align-items:center;gap:7px;font-weight:500;font-size:13.5px;color:var(--text)}
+.lcard .sub{color:var(--muted);font-size:12px}
+.lcard[aria-pressed=true] .sub{color:#8f97a3}
+
+/* точка статуса */
+.dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto;background:var(--muted)}
+.dot-on{background:#56c6a6;box-shadow:0 0 0 3px rgba(86,198,166,.14)}
+.dot-off{background:transparent;border:1.5px solid #6b7280}
+.dot-main{background:var(--accent);box-shadow:0 0 0 3px rgba(34,211,230,.14)}
+</style>
+</head>
+<body>
+<h1>Селектор локации на странице «Обзор»</h1>
+<p class="lead">Сейчас это нативный <code>&lt;select&gt;</code>. Три варианта на реальных токенах панели: шрифт, цвета и радиусы те же.</p>
+
+<!-- СЕЙЧАС -->
+<section class="variant">
+  <div class="vhead"><span class="vnum">Сейчас</span><span class="vname">Нативный select</span></div>
+  <p class="vnote">Системный список рисует сама Windows: чужой шрифт, чужой серый, тень поверх карточек. В закрытом виде непонятно, что внутри есть ещё локации, а подписи «· главный» и «· не на связи» попали в название пункта.</p>
+  <div class="toolbar">
+    <div class="native">
+      <span class="tb-label">Локация</span>
+      <select><option>Warsaw · главный</option><option>Amsterdam</option></select>
+    </div>
+    <div class="tb-spacer"></div>
+    <div class="periods"><button>1ч</button><button>6ч</button><button aria-pressed="true">24ч</button><button>7д</button><button>30д</button></div>
+  </div>
+</section>
+
+<!-- ВАРИАНТ 1 -->
+<section class="variant">
+  <div class="vhead"><span class="vnum">Вариант 1</span><span class="vname">Табы локаций</span><span class="tag">до 4–5 локаций</span></div>
+  <p class="vnote">Все локации видны сразу, переключение одним щелчком, без всплывающего слоя. Точка слева показывает состояние: голубая — главный сервер, зелёная — нода на связи, контурная — не на связи. Тот же приём, что у переключателя периода, поэтому строка читается как одно целое.</p>
+  <div class="toolbar">
+    <div class="loc-tabs" role="tablist" aria-label="Локация статистики">
+      <button role="tab" aria-selected="true"><span class="dot dot-main"></span>Warsaw<span class="role">главный</span></button>
+      <button role="tab"><span class="dot dot-on"></span>Amsterdam<span class="role">нода</span></button>
+      <button role="tab"><span class="dot dot-off"></span>Berlin<span class="role">не на связи</span></button>
+    </div>
+    <div class="tb-spacer"></div>
+    <div class="periods"><button>1ч</button><button>6ч</button><button aria-pressed="true">24ч</button><button>7д</button><button>30д</button></div>
+  </div>
+</section>
+
+<!-- ВАРИАНТ 2 -->
+<section class="variant">
+  <div class="vhead"><span class="vnum">Вариант 2</span><span class="vname">Кнопка с панелью</span><span class="tag rec">рекомендую</span></div>
+  <p class="vnote">В закрытом виде — только текущая локация и шеврон, поэтому строка не разрастается при десятке нод. В панели каждая локация одной строкой: имя, роль, состояние и задержка. Наведение, выбор и клавиатура (↑ ↓ Enter Esc) — свои, системных элементов нет. Панель закрывается по щелчку вне и не перекрывает графики тенью на весь экран.</p>
+  <div class="toolbar">
+    <span class="tb-label">Локация</span>
+    <div style="display:flex;gap:10px;align-items:flex-start">
+      <div class="loc-wrap" data-open="false">
+        <button class="loc-btn"><span class="dot dot-on"></span>Amsterdam<span class="role">нода</span>
+          <svg class="chev" width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M2.5 4.5 6 8l3.5-3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+      <div class="loc-wrap" data-open="true">
+        <button class="loc-btn"><span class="dot dot-on"></span>Amsterdam<span class="role">нода</span>
+          <svg class="chev" width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M2.5 4.5 6 8l3.5-3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <div class="loc-panel" role="listbox" aria-label="Локация статистики">
+          <div class="phead">Локации</div>
+          <button class="loc-row" role="option" aria-selected="false"><span class="dot dot-main"></span>Warsaw<span class="rmeta">главный</span><svg class="check" width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.5 5.8 10 11 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+          <button class="loc-row" role="option" aria-selected="true"><span class="dot dot-on"></span>Amsterdam<span class="rmeta">нода · 24 мс</span><svg class="check" width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.5 5.8 10 11 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+          <button class="loc-row" role="option" aria-selected="false"><span class="dot dot-off"></span>Berlin<span class="rmeta">не на связи</span><svg class="check" width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M3 7.5 5.8 10 11 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+          <div class="pfoot">↑ ↓ выбор · Enter перейти · Esc закрыть</div>
+        </div>
+      </div>
+    </div>
+    <div class="tb-spacer"></div>
+    <div class="periods"><button>1ч</button><button>6ч</button><button aria-pressed="true">24ч</button><button>7д</button><button>30д</button></div>
+  </div>
+</section>
+
+<!-- ВАРИАНТ 3 -->
+<section class="variant">
+  <div class="vhead"><span class="vnum">Вариант 3</span><span class="vname">Лента локаций с состоянием</span><span class="tag">много нод</span></div>
+  <p class="vnote">Для случая, когда нод много: видна не только выбранная, но и состояние остальных — сколько онлайн и какая задержка. Лента прокручивается по горизонтали, поэтому строка не ломает сетку. Выбранная карточка обведена акцентом. Хорошо ложится на «Обзор», который и так про мониторинг.</p>
+  <div class="toolbar">
+    <div class="strip">
+      <button class="lcard" aria-pressed="true"><span class="top"><span class="dot dot-main"></span>Warsaw</span><span class="sub">главный · 1 онлайн</span></button>
+      <button class="lcard" aria-pressed="false"><span class="top"><span class="dot dot-on"></span>Amsterdam</span><span class="sub">нода · 24 мс</span></button>
+      <button class="lcard" aria-pressed="false"><span class="top"><span class="dot dot-off"></span>Berlin</span><span class="sub">не на связи</span></button>
+    </div>
+  </div>
+</section>
+
+</body>
+<script>
+// ?v=N — рендер одного варианта: 1 Сейчас, 2 Табы, 3 Кнопка с панелью, 4 Лента.
+const v = new URLSearchParams(location.search).get('v');
+if (v) {
+  document.querySelectorAll('.variant').forEach((el, i) => { if (String(i + 1) !== v) el.remove(); });
+  document.querySelector('h1').remove();
+  document.querySelector('.lead').remove();
+  document.body.style.paddingTop = '18px';
+  document.body.style.paddingBottom = v === '3' ? '310px' : '18px';
+}
+</script>
+</html>

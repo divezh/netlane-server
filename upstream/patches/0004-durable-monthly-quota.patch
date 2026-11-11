@@ -1,0 +1,1607 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index 3f5b8d3..4649a1e 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -30,7 +30,8 @@ traffic.
+ vpn-libs-endpoint/
+ ├── lib/                       # Core library crate (`trusttunnel`)
+ │   ├── src/                   # Protocol logic, codecs, forwarders, settings
+-│   │   └── authentication/    # Authentication module
++│   │   ├── authentication/    # Authentication module
++│   │   └── usage.rs           # Durable managed quota accounting
+ │   └── tests/                 # Integration tests (tunnel, auth, ping, speedtest, reverse proxy)
+ │       └── common/            # Shared test helpers and fixtures
+ ├── endpoint/                  # Binary crate (`trusttunnel_endpoint`)
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3f24bfb..bab7fe4 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+ 
+ ## [Unreleased]
+ 
++- [Feature] Managed `quota_bytes` enforces a shared UTC monthly traffic budget
++  with a durable usage journal, 24-month history and fail-closed crash recovery.
++
+ - [Feature] Managed `expires_at` closes expired VPN sessions and denies reconnects
+   independently of the admin panel; saved policies preserve expiry across restarts.
+ 
+diff --git a/endpoint/src/main.rs b/endpoint/src/main.rs
+index c5ce269..af3a8b3 100644
+--- a/endpoint/src/main.rs
++++ b/endpoint/src/main.rs
+@@ -15,7 +15,7 @@ use trusttunnel::shutdown::Shutdown;
+ use trusttunnel::{log_utils, settings};
+ mod management;
+ 
+-const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.3");
++const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.4");
+ const VERSION_PARAM_NAME: &str = "v_e_r_s_i_o_n_do_not_change_this_name_it_will_break";
+ const LOG_LEVEL_PARAM_NAME: &str = "log_level";
+ const LOG_FILE_PARAM_NAME: &str = "log_file";
+@@ -545,7 +545,9 @@ fn main() {
+         let socket = args.get_one::<String>("control-socket").cloned();
+         async move {
+             match (management, socket) {
+-                (Some(m), Some(path)) => m.serve(PathBuf::from(path)).await,
++                (Some(m), Some(path)) => {
++                    tokio::try_join!(m.clone().serve(PathBuf::from(path)), m.maintain()).map(|_| ())
++                }
+                 _ => std::future::pending::<std::io::Result<()>>().await,
+             }
+         }
+diff --git a/endpoint/src/management.rs b/endpoint/src/management.rs
+index 7226e95..ad625cc 100644
+--- a/endpoint/src/management.rs
++++ b/endpoint/src/management.rs
+@@ -24,6 +24,8 @@ pub struct ManagedUser {
+     pub upload_mbps: u32,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub expires_at: Option<String>,
++    #[serde(default, skip_serializing_if = "zero")]
++    pub quota_bytes: u64,
+     pub revision: u64,
+     #[serde(default)]
+     pub max_http2_conns: Option<u32>,
+@@ -34,6 +36,8 @@ pub struct ManagedUser {
+ #[serde(deny_unknown_fields)]
+ pub struct State {
+     pub version: u32,
++    #[serde(default)]
++    pub usage_version: u32,
+     pub generation: u64,
+     pub users: Vec<ManagedUser>,
+ }
+@@ -41,6 +45,12 @@ pub struct State {
+ #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+ enum Request {
+     Status,
++    Usage {
++        #[serde(default)]
++        month: String,
++        #[serde(default)]
++        after: String,
++    },
+     Upsert {
+         expected_generation: u64,
+         user: ManagedUser,
+@@ -54,6 +64,10 @@ pub struct Management {
+     path: PathBuf,
+     core: Arc<Core>,
+     registry: Arc<RegistryBasedAuthenticator>,
++    usage: Arc<trusttunnel::usage::UsageLedger>,
++}
++fn zero(n: &u64) -> bool {
++    *n == 0
+ }
+ fn invalid() -> io::Error {
+     io::Error::new(io::ErrorKind::InvalidData, "invalid managed state")
+@@ -92,6 +106,7 @@ impl State {
+             }
+             Err(e) if e.kind() == io::ErrorKind::NotFound => Self {
+                 version: 1,
++                usage_version: 0,
+                 generation: 0,
+                 users: clients
+                     .iter()
+@@ -103,6 +118,7 @@ impl State {
+                         download_mbps: 0,
+                         upload_mbps: 0,
+                         expires_at: None,
++                        quota_bytes: 0,
+                         revision: 1,
+                         max_http2_conns: c.max_http2_conns,
+                         max_http3_conns: c.max_http3_conns,
+@@ -115,7 +131,7 @@ impl State {
+         Ok(state)
+     }
+     fn validate(&self) -> io::Result<()> {
+-        if self.version != 1 || self.users.len() > 100 {
++        if self.version != 1 || self.usage_version > 1 || self.users.len() > 100 {
+             return Err(invalid());
+         }
+         let mut names = HashSet::new();
+@@ -134,6 +150,7 @@ impl State {
+                 || u.revision == 0
+                 || u.download_mbps > 1000000
+                 || u.upload_mbps > 1000000
++                || u.quota_bytes > (1u64 << 50)
+                 || expiry_millis(u.expires_at.as_deref()).is_err()
+                 || !names.insert(&u.username)
+                 || !ids.insert(&u.id)
+@@ -165,22 +182,29 @@ impl State {
+         std::fs::File::open(parent)?.sync_all()
+     }
+     fn public(&self) -> serde_json::Value {
+-        serde_json::json!({"version":1,"generation":self.generation,"capabilities":{"hot_reload":true,"disconnect_user":true,"speed_limits":true,"durable_quotas":false,"expiry":true},"users":self.users.iter().map(|u|serde_json::json!({"id":u.id,"username":u.username,"revision":u.revision,"enabled":u.enabled,"download_mbps":u.download_mbps,"upload_mbps":u.upload_mbps,"expires_at":u.expires_at,"expired":expiry_millis(u.expires_at.as_deref()).ok().flatten().is_some_and(|at| chrono::Utc::now().timestamp_millis() >= at)})).collect::<Vec<_>>()})
++        serde_json::json!({"version":1,"generation":self.generation,"capabilities":{"hot_reload":true,"disconnect_user":true,"speed_limits":true,"durable_quotas":true,"expiry":true},"users":self.users.iter().map(|u|serde_json::json!({"id":u.id,"username":u.username,"revision":u.revision,"enabled":u.enabled,"download_mbps":u.download_mbps,"upload_mbps":u.upload_mbps,"quota_bytes":u.quota_bytes,"expires_at":u.expires_at,"expired":expiry_millis(u.expires_at.as_deref()).ok().flatten().is_some_and(|at| chrono::Utc::now().timestamp_millis() >= at)})).collect::<Vec<_>>()})
+     }
+ }
+ impl Management {
+     pub fn new(
+-        state: State,
++        mut state: State,
+         path: PathBuf,
+         core: Arc<Core>,
+         registry: Arc<RegistryBasedAuthenticator>,
+     ) -> io::Result<Arc<Self>> {
++        let usage = trusttunnel::usage::UsageLedger::open(
++            &path.with_extension("usage.jsonl"),
++            state.usage_version == 0,
++        )?;
++        core.traffic_control().set_usage_ledger(usage.clone())?;
++        state.usage_version = 1;
+         state.persist(&path)?;
+         let this = Arc::new(Self {
+             state: Mutex::new(state.clone()),
+             path,
+             core,
+             registry,
++            usage,
+         });
+         this.apply(&state)?;
+         Ok(this)
+@@ -193,10 +217,12 @@ impl Management {
+                 .users
+                 .iter()
+                 .map(|u| TrafficPolicy {
++                    user_id: u.id.clone(),
+                     username: u.username.clone(),
+                     enabled: u.enabled,
+                     download_mbps: u.download_mbps,
+                     upload_mbps: u.upload_mbps,
++                    quota_bytes: u.quota_bytes,
+                     expires_at_unix_ms: expiry_millis(u.expires_at.as_deref())
+                         .expect("validated expiry"),
+                 })
+@@ -208,7 +234,8 @@ impl Management {
+     async fn handle(&self, request: Request) -> serde_json::Value {
+         let mut state = self.state.lock().await;
+         match request {
+-            Request::Status => serde_json::json!({"ok":true,"state":state.public()}),
++            Request::Status => self.reply(&state),
++            Request::Usage { month, after } => self.usage_reply(&month, &after),
+             Request::Disconnect { username } => {
+                 if !state.users.iter().any(|u| u.username == username) {
+                     return serde_json::json!({"ok":false,"error":"user_not_found"});
+@@ -235,7 +262,7 @@ impl Management {
+                         if state.persist(&self.path).is_err() {
+                             return serde_json::json!({"ok":false,"error":"state_write_failed"});
+                         }
+-                        return serde_json::json!({"ok":true,"state":state.public()});
++                        return self.reply(&state);
+                     }
+                     *old = user;
+                 } else {
+@@ -285,8 +312,85 @@ impl Management {
+                 if !durable {
+                     return serde_json::json!({"ok":false,"error":"state_durability_uncertain"});
+                 }
+-                serde_json::json!({"ok":true,"state":state.public()})
++                self.reply(&state)
++            }
++        }
++    }
++    fn reply(&self, state: &State) -> serde_json::Value {
++        match self.usage.snapshot() {
++            Ok(usage) => {
++                let mut public = state.public();
++                public["usage"] = serde_json::json!({"month":usage.month,"started_at":usage.started_at,"credit_bytes":usage.credit_bytes});
++                for u in public["users"].as_array_mut().unwrap() {
++                    let id = u["id"].as_str().unwrap();
++                    let limit = u["quota_bytes"].as_u64().unwrap();
++                    let exhausted = !self.usage.allowed(id, limit);
++                    let used = usage
++                        .records
++                        .iter()
++                        .find(|r| r.record.user_id == id && r.record.month == usage.month)
++                        .map(|r| r.charged_bytes)
++                        .unwrap_or(0);
++                    u["quota_used_bytes"] = serde_json::json!(used);
++                    u["quota_exhausted"] = serde_json::json!(exhausted);
++                }
++                serde_json::json!({"ok":true,"state":public})
+             }
++            Err(_) => serde_json::json!({"ok":false,"error":"usage_unavailable"}),
++        }
++    }
++    fn usage_reply(&self, month: &str, after: &str) -> serde_json::Value {
++        let Ok(usage) = self.usage.snapshot() else {
++            return serde_json::json!({"ok":false,"error":"usage_unavailable"});
++        };
++        let month = if month.is_empty() {
++            usage.month.as_str()
++        } else {
++            month
++        };
++        let mut months: Vec<_> = usage
++            .records
++            .iter()
++            .map(|r| r.record.month.clone())
++            .chain(std::iter::once(usage.month.clone()))
++            .collect();
++        months.sort();
++        months.dedup();
++        months.reverse();
++        if after.len() > 128 || !months.iter().any(|m| m == month) {
++            return serde_json::json!({"ok":false,"error":"usage_month_unavailable"});
++        }
++        let rows: Vec<_> = usage
++            .records
++            .iter()
++            .filter(|r| r.record.month == month)
++            .collect();
++        let totals = rows.iter().fold([0u64; 4], |mut t, r| {
++            t[0] = t[0].saturating_add(r.charged_bytes);
++            t[1] = t[1].saturating_add(r.record.upload_bytes);
++            t[2] = t[2].saturating_add(r.record.download_bytes);
++            t[3] = t[3].saturating_add(r.uncertain_bytes);
++            t
++        });
++        let page: Vec<_> = rows
++            .iter()
++            .filter(|r| r.record.user_id.as_str() > after)
++            .take(100)
++            .collect();
++        let next = page
++            .last()
++            .filter(|last| rows.iter().any(|r| r.record.user_id > last.record.user_id))
++            .map(|r| r.record.user_id.clone());
++        serde_json::json!({"ok":true,"usage":{"month":month,"started_at":usage.started_at,"credit_bytes":usage.credit_bytes,"months":months,"records":page,"next_after":next,"total_users":rows.len(),"totals":{"charged_bytes":totals[0],"upload_bytes":totals[1],"download_bytes":totals[2],"uncertain_bytes":totals[3]}}})
++    }
++    pub async fn maintain(self: Arc<Self>) -> io::Result<()> {
++        let mut interval = tokio::time::interval(Duration::from_secs(30));
++        loop {
++            interval.tick().await;
++            let usage = self.usage.clone();
++            tokio::task::spawn_blocking(move || usage.checkpoint())
++                .await
++                .map_err(io::Error::other)??;
+         }
+     }
+     pub async fn serve(self: Arc<Self>, path: PathBuf) -> io::Result<()> {
+@@ -335,6 +439,12 @@ impl Management {
+                         }
+                     };
+                     let mut bytes = serde_json::to_vec(&response).map_err(|_| invalid())?;
++                    if bytes.len() >= 65536 {
++                        bytes = serde_json::to_vec(
++                            &serde_json::json!({"ok":false,"error":"response_too_large"}),
++                        )
++                        .map_err(|_| invalid())?;
++                    }
+                     bytes.push(b'\n');
+                     write.write_all(&bytes).await?;
+                     Ok::<_, io::Error>(())
+@@ -362,6 +472,41 @@ impl Drop for SocketGuard {
+ mod tests {
+     use super::*;
+     #[test]
++    fn largest_status_stays_within_rpc_response_bound() {
++        let state = State {
++            version: 1,
++            usage_version: 1,
++            generation: u64::MAX,
++            users: (0..100)
++                .map(|i| ManagedUser {
++                    id: format!("{i:0128}"),
++                    username: format!("u{i:063}"),
++                    password: "test-password".into(),
++                    enabled: true,
++                    download_mbps: 1000000,
++                    upload_mbps: 1000000,
++                    quota_bytes: 1 << 50,
++                    expires_at: Some("9999-12-31T23:59:59.999999999Z".into()),
++                    revision: u64::MAX,
++                    max_http2_conns: None,
++                    max_http3_conns: None,
++                })
++                .collect(),
++        };
++        state.validate().unwrap();
++        let mut public = state.public();
++        for u in public["users"].as_array_mut().unwrap() {
++            u["quota_used_bytes"] = serde_json::json!(u64::MAX);
++            u["quota_exhausted"] = serde_json::json!(false);
++        }
++        assert!(
++            serde_json::to_vec(&serde_json::json!({"ok":true,"state":public}))
++                .unwrap()
++                .len()
++                < 65536
++        );
++    }
++    #[test]
+     fn expiry_parsing_rejects_bad_dates_and_preserves_offsets() {
+         assert_eq!(expiry_millis(None).unwrap(), None);
+         assert_eq!(
+@@ -379,6 +524,7 @@ mod tests {
+         let path = dir.path().join("state.json");
+         let s = State {
+             version: 1,
++            usage_version: 0,
+             generation: 3,
+             users: vec![ManagedUser {
+                 id: "u1".into(),
+@@ -388,6 +534,7 @@ mod tests {
+                 download_mbps: 2,
+                 upload_mbps: 1,
+                 expires_at: Some("2030-01-01T00:00:00Z".into()),
++                quota_bytes: 0,
+                 revision: 2,
+                 max_http2_conns: None,
+                 max_http3_conns: None,
+diff --git a/lib/Cargo.toml b/lib/Cargo.toml
+index ebf4377..ff7b976 100644
+--- a/lib/Cargo.toml
++++ b/lib/Cargo.toml
+@@ -39,6 +39,7 @@ rustls-native-certs = "0.7"
+ rustls-pki-types = "1.13.2"
+ serde = "1.0.164"
+ serde_json = "1.0"
++tempfile = "3"
+ smallvec = "1.10.0"
+ socket2 = "0.5"
+ tokio = { version = "1.42", features = ["net", "rt", "sync", "time", "macros", "rt-multi-thread"] }
+diff --git a/lib/src/datagram_pipe.rs b/lib/src/datagram_pipe.rs
+index c3d3a97..7e35a6f 100644
+--- a/lib/src/datagram_pipe.rs
++++ b/lib/src/datagram_pipe.rs
+@@ -142,11 +142,16 @@ impl<D: Datagram + Debug, F: Fn(pipe::SimplexDirection, usize) + Send> GenericSi
+             );
+ 
+             let datagram_len = datagram.len();
+-            if let Some(control) = &self.control {
+-                control.acquire(self.direction, datagram_len).await?;
+-            }
++            let permit = if let Some(control) = &self.control {
++                Some(control.permit(self.direction, datagram_len, true).await?)
++            } else {
++                None
++            };
+             match self.sink.write(datagram).await? {
+                 SendStatus::Sent => {
++                    if let Some(permit) = permit {
++                        permit.commit(datagram_len);
++                    }
+                     (self.update_metrics)(self.direction, datagram_len);
+                 }
+                 SendStatus::Dropped => log_id!(
+diff --git a/lib/src/lib.rs b/lib/src/lib.rs
+index d37dc8b..02e49f5 100644
+--- a/lib/src/lib.rs
++++ b/lib/src/lib.rs
+@@ -47,3 +47,4 @@ mod tls_listener;
+ mod tunnel;
+ mod udp_forwarder;
+ mod udp_pipe;
++pub mod usage;
+diff --git a/lib/src/pipe.rs b/lib/src/pipe.rs
+index 073bcd7..e562e0e 100644
+--- a/lib/src/pipe.rs
++++ b/lib/src/pipe.rs
+@@ -182,16 +182,18 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
+             match data {
+                 Data::Chunk(bytes) => {
+                     let data_len = bytes.len();
+-                    let granted = if let Some(control) = &self.control {
++                    let permit = if let Some(control) = &self.control {
+                         let n = data_len.min(16384);
+-                        control
+-                            .acquire(self.direction, n)
+-                            .await
+-                            .map_err(|e| io_to_pipe_error(id, e))?;
+-                        n
++                        Some(
++                            control
++                                .permit(self.direction, n, false)
++                                .await
++                                .map_err(|e| io_to_pipe_error(id, e))?,
++                        )
+                     } else {
+-                        data_len
++                        None
+                     };
++                    let granted = permit.as_ref().map(|p| p.bytes).unwrap_or(data_len);
+                     let unsent_data = self
+                         .sink
+                         .write(bytes.slice(..granted))
+@@ -200,6 +202,9 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
+                     if let Some(control) = &self.control {
+                         control.refund(self.direction, granted - sent);
+                     }
++                    if let Some(permit) = permit {
++                        permit.commit(sent);
++                    }
+                     (self.update_metrics)(self.direction, sent);
+                     self.source
+                         .consume(sent)
+@@ -362,11 +367,13 @@ mod managed_tests {
+     async fn partial_writes_are_not_charged_repeatedly() {
+         let control = Arc::new(crate::traffic_control::TrafficControl::default());
+         control.replace(&[crate::traffic_control::TrafficPolicy {
++            user_id: "alice".into(),
+             username: "alice".into(),
+             enabled: true,
+             download_mbps: 1,
+             upload_mbps: 1,
+             expires_at_unix_ms: None,
++            quota_bytes: 0,
+         }]);
+         let session = control.session();
+         let user = session.bind("alice").unwrap().unwrap();
+diff --git a/lib/src/traffic_control.rs b/lib/src/traffic_control.rs
+index 6e0cbe2..74056c6 100644
+--- a/lib/src/traffic_control.rs
++++ b/lib/src/traffic_control.rs
+@@ -11,12 +11,15 @@ use tokio::time::{Duration, Instant};
+ #[derive(Clone, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+ pub struct TrafficPolicy {
++    pub user_id: String,
+     pub username: String,
+     pub enabled: bool,
+     pub download_mbps: u32,
+     pub upload_mbps: u32,
+     #[serde(default)]
+     pub expires_at_unix_ms: Option<i64>,
++    #[serde(default)]
++    pub quota_bytes: u64,
+ }
+ 
+ struct Expiry {
+@@ -60,6 +63,20 @@ pub(crate) struct UserControl {
+     upload: Mutex<Bucket>,
+     changed: watch::Sender<u64>,
+     expiry: Mutex<Expiry>,
++    user_id: String,
++    quota: AtomicU64,
++    ledger: Option<Arc<crate::usage::UsageLedger>>,
++}
++pub(crate) struct TransferPermit {
++    pub bytes: usize,
++    credit: Option<crate::usage::Credit>,
++}
++impl TransferPermit {
++    pub fn commit(self, sent: usize) {
++        if let Some(credit) = self.credit {
++            credit.commit(sent);
++        }
++    }
+ }
+ impl UserControl {
+     fn active_at(&self, now: i64) -> bool {
+@@ -69,6 +86,10 @@ impl UserControl {
+     }
+     fn active(&self) -> bool {
+         self.active_at(chrono::Utc::now().timestamp_millis())
++            && match &self.ledger {
++                Some(book) => book.allowed(&self.user_id, self.quota.load(Ordering::Acquire)),
++                None => self.quota.load(Ordering::Acquire) == 0,
++            }
+     }
+     async fn unavailable(&self) {
+         let mut changed = self.changed.subscribe();
+@@ -78,8 +99,10 @@ impl UserControl {
+                 return;
+             }
+             let at = self.expiry.lock().unwrap().at;
+-            if let Some(at) = at {
+-                let remaining = at.saturating_sub(chrono::Utc::now().timestamp_millis());
++            if at.is_some() || self.ledger.is_some() {
++                let remaining = at
++                    .map(|at| at.saturating_sub(chrono::Utc::now().timestamp_millis()))
++                    .unwrap_or(1000);
+                 let delay = Duration::from_millis(remaining.clamp(1, 1000) as u64);
+                 tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = changed.changed() => {} }
+             } else if changed.changed().await.is_err() {
+@@ -95,7 +118,7 @@ impl UserControl {
+         b.refill();
+         b.tokens = (b.tokens + bytes as f64).min(Bucket::capacity(b.rate));
+     }
+-    fn new(p: &TrafficPolicy) -> Self {
++    fn new(p: &TrafficPolicy, ledger: Option<Arc<crate::usage::UsageLedger>>) -> Self {
+         Self {
+             enabled: AtomicBool::new(p.enabled),
+             download: Mutex::new(Bucket::new(p.download_mbps)),
+@@ -105,6 +128,9 @@ impl UserControl {
+                 at: p.expires_at_unix_ms,
+                 elapsed: false,
+             }),
++            user_id: p.user_id.clone(),
++            quota: AtomicU64::new(p.quota_bytes),
++            ledger,
+         }
+     }
+     fn update(&self, p: &TrafficPolicy) {
+@@ -120,6 +146,7 @@ impl UserControl {
+         self.download.lock().unwrap().update(p.download_mbps);
+         self.upload.lock().unwrap().update(p.upload_mbps);
+         self.enabled.store(p.enabled, Ordering::Release);
++        self.quota.store(p.quota_bytes, Ordering::Release);
+         self.changed.send_modify(|n| *n = n.wrapping_add(1));
+     }
+     pub(crate) async fn acquire(
+@@ -162,6 +189,57 @@ impl UserControl {
+         }
+         Ok(())
+     }
++    pub(crate) async fn permit(
++        self: &Arc<Self>,
++        direction: SimplexDirection,
++        bytes: usize,
++        whole: bool,
++    ) -> io::Result<TransferPermit> {
++        self.acquire(direction, bytes).await?;
++        if bytes == 0 {
++            return Ok(TransferPermit {
++                bytes: 0,
++                credit: None,
++            });
++        }
++        let Some(ledger) = &self.ledger else {
++            return Ok(TransferPermit {
++                bytes,
++                credit: None,
++            });
++        };
++        loop {
++            if !self.active() {
++                return Err(io::ErrorKind::PermissionDenied.into());
++            }
++            let limit = self.quota.load(Ordering::Acquire);
++            match ledger.try_credit(
++                &self.user_id,
++                limit,
++                bytes,
++                direction == SimplexDirection::Outgoing,
++                whole,
++            )? {
++                crate::usage::Attempt::Granted(credit) => {
++                    self.refund(direction, bytes - credit.bytes);
++                    return Ok(TransferPermit {
++                        bytes: credit.bytes,
++                        credit: Some(credit),
++                    });
++                }
++                crate::usage::Attempt::Exhausted => {
++                    return Err(io::ErrorKind::PermissionDenied.into())
++                }
++                crate::usage::Attempt::Persist => {
++                    let ledger = ledger.clone();
++                    let user = self.user_id.clone();
++                    tokio::task::spawn_blocking(move || ledger.refill(&user, limit))
++                        .await
++                        .map_err(io::Error::other)??;
++                }
++            }
++        }
++    }
+ }
+ 
+ #[derive(Default)]
+@@ -169,6 +247,7 @@ pub struct TrafficControl {
+     policies: RwLock<Option<HashMap<String, Arc<UserControl>>>>,
+     sessions: Mutex<HashMap<u64, Weak<ManagedSession>>>,
+     next: AtomicU64,
++    ledger: RwLock<Option<Arc<crate::usage::UsageLedger>>>,
+ }
+ pub(crate) struct ManagedSession {
+     id: u64,
+@@ -233,15 +312,23 @@ impl ManagedSession {
+     }
+ }
+ impl TrafficControl {
++    pub fn set_usage_ledger(&self, ledger: Arc<crate::usage::UsageLedger>) -> io::Result<()> {
++        if self.policies.read().unwrap().is_some() {
++            return Err(io::Error::other(
++                "usage journal must be set before policies",
++            ));
++        }
++        *self.ledger.write().unwrap() = Some(ledger);
++        Ok(())
++    }
+     pub fn replace(&self, replacement: &[TrafficPolicy]) {
+         let mut policies = self.policies.write().unwrap();
+         let old = policies.get_or_insert_with(HashMap::new);
+         let mut next = HashMap::new();
+         for p in replacement {
+-            let user = old
+-                .get(&p.username)
+-                .cloned()
+-                .unwrap_or_else(|| Arc::new(UserControl::new(p)));
++            let user = old.get(&p.username).cloned().unwrap_or_else(|| {
++                Arc::new(UserControl::new(p, self.ledger.read().unwrap().clone()))
++            });
+             user.update(p);
+             next.insert(p.username.clone(), user);
+         }
+@@ -309,18 +396,20 @@ mod tests {
+     use super::*;
+     fn policy(name: &str) -> TrafficPolicy {
+         TrafficPolicy {
++            user_id: name.into(),
+             username: name.into(),
+             enabled: true,
+             download_mbps: 1,
+             upload_mbps: 1,
+             expires_at_unix_ms: None,
++            quota_bytes: 0,
+         }
+     }
+     #[test]
+     fn expiry_boundary_latches_until_the_deadline_changes() {
+         let mut p = policy("alice");
+         p.expires_at_unix_ms = Some(2000);
+-        let user = UserControl::new(&p);
++        let user = UserControl::new(&p, None);
+         assert!(user.active_at(1999));
+         assert!(!user.active_at(2000));
+         assert!(!user.active_at(1000));
+diff --git a/lib/src/udp_pipe.rs b/lib/src/udp_pipe.rs
+index 91277e0..81835b5 100644
+--- a/lib/src/udp_pipe.rs
++++ b/lib/src/udp_pipe.rs
+@@ -73,11 +73,16 @@ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> LeftPipe<F> {
+             }
+ 
+             let datagram_len = datagram.payload.len();
+-            if let Some(control) = &self.control {
+-                control.acquire(self.direction, datagram_len).await?;
+-            }
++            let permit = if let Some(control) = &self.control {
++                Some(control.permit(self.direction, datagram_len, true).await?)
++            } else {
++                None
++            };
+             match self.sink.write(datagram).await? {
+                 datagram_pipe::SendStatus::Sent => {
++                    if let Some(permit) = permit {
++                        permit.commit(datagram_len);
++                    }
+                     (self.shared.update_metrics)(self.direction, datagram_len);
+                 }
+                 datagram_pipe::SendStatus::Dropped => {
+@@ -152,11 +157,16 @@ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> RightPipe<F> {
+ 
+             let meta = datagram.meta;
+             let datagram_len = datagram.payload.len();
+-            if let Some(control) = &self.control {
+-                control.acquire(self.direction, datagram_len).await?;
+-            }
++            let permit = if let Some(control) = &self.control {
++                Some(control.permit(self.direction, datagram_len, true).await?)
++            } else {
++                None
++            };
+             match self.sink.write(datagram).await? {
+                 datagram_pipe::SendStatus::Sent => {
++                    if let Some(permit) = permit {
++                        permit.commit(datagram_len);
++                    }
+                     (self.shared.update_metrics)(self.direction, datagram_len);
+                 }
+                 datagram_pipe::SendStatus::Dropped => {
+diff --git a/lib/src/usage.rs b/lib/src/usage.rs
+new file mode 100644
+index 0000000..cff56df
+--- /dev/null
++++ b/lib/src/usage.rs
+@@ -0,0 +1,695 @@
++//! Durable write-ahead credit shared by all transports of an immutable user ID.
++use chrono::{Datelike, Utc};
++use serde::{Deserialize, Serialize};
++use std::collections::BTreeMap;
++use std::fs::{File, OpenOptions};
++use std::io::{self, BufRead, BufReader, Write};
++use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
++use std::path::{Path, PathBuf};
++use std::sync::{Arc, Mutex};
++
++pub const CREDIT_BYTES: u64 = 1024 * 1024;
++const COMPACT_BYTES: u64 = 8 * 1024 * 1024;
++const MAX_BYTES: u64 = 16 * 1024 * 1024;
++
++#[derive(Clone, Default, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct UsageRecord {
++    pub user_id: String,
++    pub month: String,
++    pub reserved_bytes: u64,
++    pub upload_bytes: u64,
++    pub download_bytes: u64,
++}
++#[derive(Serialize)]
++pub struct UsageView {
++    #[serde(flatten)]
++    pub record: UsageRecord,
++    pub charged_bytes: u64,
++    pub in_flight_bytes: u64,
++    pub uncertain_bytes: u64,
++}
++#[derive(Serialize)]
++pub struct UsageSnapshot {
++    pub month: String,
++    pub started_at: String,
++    pub credit_bytes: u64,
++    pub records: Vec<UsageView>,
++}
++#[derive(Serialize, Deserialize)]
++#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
++enum Event {
++    Header {
++        version: u32,
++        month: String,
++        started_at: String,
++    },
++    Month {
++        month: String,
++    },
++    Usage {
++        record: UsageRecord,
++    },
++}
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Envelope {
++    data: Event,
++    checksum: String,
++}
++struct Entry {
++    record: UsageRecord,
++    available: u64,
++    in_flight: u64,
++    dirty: bool,
++}
++struct Book {
++    month: String,
++    started_at: String,
++    entries: BTreeMap<(String, String), Entry>,
++    file: File,
++    bytes: u64,
++    broken: bool,
++}
++pub struct UsageLedger {
++    path: PathBuf,
++    _lock: File,
++    book: Mutex<Book>,
++}
++pub(crate) enum Attempt {
++    Granted(Credit),
++    Persist,
++    Exhausted,
++}
++pub(crate) struct Credit {
++    ledger: Arc<UsageLedger>,
++    key: (String, String),
++    pub bytes: usize,
++    upload: bool,
++    settled: bool,
++}
++fn invalid() -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidData, "invalid usage journal")
++}
++fn valid_month(value: &str) -> bool {
++    value.len() == 7
++        && value.as_bytes()[4] == b'-'
++        && value[..4].bytes().all(|b| b.is_ascii_digit())
++        && value[5..]
++            .parse::<u8>()
++            .is_ok_and(|m| (1..=12).contains(&m))
++}
++fn month_now() -> String {
++    let now = Utc::now();
++    format!("{:04}-{:02}", now.year(), now.month())
++}
++fn cutoff(month: &str) -> String {
++    let n = (month[..4].parse::<u32>().unwrap() * 12 + month[5..].parse::<u32>().unwrap() - 1)
++        .saturating_sub(23);
++    format!("{:04}-{:02}", n / 12, n % 12 + 1)
++}
++fn checksum(event: &Event) -> io::Result<String> {
++    let bytes = serde_json::to_vec(event).map_err(|_| invalid())?;
++    Ok(hex::encode(
++        ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref(),
++    ))
++}
++fn encode(event: Event) -> io::Result<Vec<u8>> {
++    let checksum = checksum(&event)?;
++    let mut line = serde_json::to_vec(&Envelope {
++        data: event,
++        checksum,
++    })
++    .map_err(|_| invalid())?;
++    line.push(b'\n');
++    Ok(line)
++}
++fn open_private(path: &Path, create: bool) -> io::Result<File> {
++    let file = OpenOptions::new()
++        .read(true)
++        .append(true)
++        .create(create)
++        .mode(0o600)
++        .custom_flags(libc::O_NOFOLLOW)
++        .open(path)?;
++    let meta = file.metadata()?;
++    if !meta.is_file() || meta.permissions().mode() & 0o077 != 0 || meta.len() > MAX_BYTES {
++        return Err(invalid());
++    }
++    Ok(file)
++}
++impl UsageLedger {
++    pub fn open(path: &Path, allow_create: bool) -> io::Result<Arc<Self>> {
++        Self::open_at(path, allow_create, &month_now())
++    }
++    fn open_at(path: &Path, allow_create: bool, now: &str) -> io::Result<Arc<Self>> {
++        if !path.is_absolute() {
++            return Err(invalid());
++        }
++        let parent = path.parent().ok_or_else(invalid)?;
++        let meta = std::fs::metadata(parent)?;
++        if !meta.is_dir() || meta.permissions().mode() & 0o027 != 0 {
++            return Err(invalid());
++        }
++        let lock_path = path.with_extension("lock");
++        let lock = open_private(&lock_path, true)?;
++        lock.try_lock().map_err(|_| {
++            io::Error::new(io::ErrorKind::WouldBlock, "usage journal already in use")
++        })?;
++        let file = open_private(path, allow_create)?;
++        let mut book = Book {
++            month: String::new(),
++            started_at: String::new(),
++            entries: BTreeMap::new(),
++            bytes: file.metadata()?.len(),
++            file,
++            broken: false,
++        };
++        if book.bytes == 0 {
++            if !allow_create {
++                return Err(invalid());
++            }
++            book.month = now.into();
++            book.started_at = Utc::now().to_rfc3339();
++            let data = encode(Event::Header {
++                version: 1,
++                month: book.month.clone(),
++                started_at: book.started_at.clone(),
++            })?;
++            book.file.write_all(&data)?;
++            book.file.sync_all()?;
++            File::open(parent)?.sync_all()?;
++            book.bytes = data.len() as u64;
++        } else {
++            for (index, line) in BufReader::new(book.file.try_clone()?)
++                .split(b'\n')
++                .enumerate()
++            {
++                let line = line?;
++                if line.is_empty() {
++                    return Err(invalid());
++                }
++                let event: Envelope = serde_json::from_slice(&line).map_err(|_| invalid())?;
++                if checksum(&event.data)? != event.checksum {
++                    return Err(invalid());
++                }
++                match event.data {
++                    Event::Header {
++                        version,
++                        month,
++                        started_at,
++                    } if index == 0
++                        && version == 1
++                        && valid_month(&month)
++                        && chrono::DateTime::parse_from_rfc3339(&started_at).is_ok() =>
++                    {
++                        book.month = month;
++                        book.started_at = started_at;
++                    }
++                    Event::Month { month }
++                        if index > 0 && valid_month(&month) && month > book.month =>
++                    {
++                        let oldest = cutoff(&month);
++                        book.entries.retain(|(m, _), _| m >= &oldest);
++                        book.month = month;
++                    }
++                    Event::Usage { record } if index > 0 => {
++                        if record.user_id.is_empty()
++                            || record.user_id.len() > 128
++                            || !valid_month(&record.month)
++                            || record.month > book.month
++                            || record
++                                .upload_bytes
++                                .checked_add(record.download_bytes)
++                                .is_none_or(|n| n > record.reserved_bytes)
++                        {
++                            return Err(invalid());
++                        }
++                        let key = (record.month.clone(), record.user_id.clone());
++                        if record.month >= cutoff(&book.month) {
++                            book.entries.insert(
++                                key,
++                                Entry {
++                                    record,
++                                    available: 0,
++                                    in_flight: 0,
++                                    dirty: false,
++                                },
++                            );
++                        }
++                    }
++                    _ => return Err(invalid()),
++                }
++            }
++            use std::io::{Read, Seek, SeekFrom};
++            let mut check = book.file.try_clone()?;
++            check.seek(SeekFrom::End(-1))?;
++            let mut end = [0];
++            check.read_exact(&mut end)?;
++            if end[0] != b'\n' {
++                return Err(invalid());
++            }
++        }
++        if book.month.as_str() > now {
++            return Err(io::Error::new(
++                io::ErrorKind::PermissionDenied,
++                "UTC month moved backwards",
++            ));
++        }
++        Ok(Arc::new(Self {
++            path: path.into(),
++            _lock: lock,
++            book: Mutex::new(book),
++        }))
++    }
++    fn compact(&self, book: &mut Book) -> io::Result<()> {
++        let parent = self.path.parent().ok_or_else(invalid)?;
++        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
++        tmp.write_all(&encode(Event::Header {
++            version: 1,
++            month: book.month.clone(),
++            started_at: book.started_at.clone(),
++        })?)?;
++        for entry in book.entries.values() {
++            tmp.write_all(&encode(Event::Usage {
++                record: entry.record.clone(),
++            })?)?;
++        }
++        tmp.as_file().sync_all()?;
++        tmp.persist(&self.path).map_err(|e| e.error)?;
++        File::open(parent)?.sync_all()?;
++        book.file = open_private(&self.path, false)?;
++        book.bytes = book.file.metadata()?.len();
++        Ok(())
++    }
++    fn append(&self, book: &mut Book, event: Event) -> io::Result<()> {
++        let result = (|| {
++            let line = encode(event)?;
++            book.file.write_all(&line)?;
++            book.file.sync_data()?;
++            book.bytes += line.len() as u64;
++            if book.bytes >= COMPACT_BYTES {
++                self.compact(book)?;
++            }
++            Ok(())
++        })();
++        if result.is_err() {
++            book.broken = true;
++        }
++        result
++    }
++    fn healthy(book: &Book, month: &str) -> io::Result<()> {
++        if book.broken || month < book.month.as_str() {
++            return Err(io::Error::new(
++                io::ErrorKind::PermissionDenied,
++                "usage journal unavailable",
++            ));
++        }
++        Ok(())
++    }
++    fn remaining(entry: &Entry, limit: u64) -> u64 {
++        if limit == 0 {
++            u64::MAX - entry.record.reserved_bytes + entry.available
++        } else {
++            limit.saturating_sub(entry.record.reserved_bytes - entry.available)
++        }
++    }
++    pub fn allowed(&self, user: &str, limit: u64) -> bool {
++        let month = month_now();
++        let book = self.book.lock().unwrap();
++        if Self::healthy(&book, &month).is_err() {
++            return false;
++        }
++        book.entries
++            .get(&(month, user.into()))
++            .is_none_or(|e| Self::remaining(e, limit) > 0 || e.in_flight > 0)
++    }
++    pub(crate) fn try_credit(
++        self: &Arc<Self>,
++        user: &str,
++        limit: u64,
++        requested: usize,
++        upload: bool,
++        whole: bool,
++    ) -> io::Result<Attempt> {
++        self.try_credit_at(user, limit, requested, upload, whole, &month_now())
++    }
++    fn try_credit_at(
++        self: &Arc<Self>,
++        user: &str,
++        limit: u64,
++        requested: usize,
++        upload: bool,
++        whole: bool,
++        month: &str,
++    ) -> io::Result<Attempt> {
++        let mut book = self.book.lock().unwrap();
++        Self::healthy(&book, month)?;
++        if month > book.month.as_str() {
++            return Ok(Attempt::Persist);
++        }
++        let key = (month.into(), user.into());
++        let Some(entry) = book.entries.get_mut(&key) else {
++            return Ok(Attempt::Persist);
++        };
++        let remaining = Self::remaining(entry, limit);
++        if remaining == 0 || whole && remaining < requested as u64 {
++            return Ok(Attempt::Exhausted);
++        }
++        if requested > 0 && (entry.available == 0 || whole && entry.available < requested as u64) {
++            return Ok(Attempt::Persist);
++        }
++        let n = (requested as u64).min(entry.available).min(remaining);
++        entry.available -= n;
++        entry.in_flight += n;
++        Ok(Attempt::Granted(Credit {
++            ledger: self.clone(),
++            key,
++            bytes: n as usize,
++            upload,
++            settled: false,
++        }))
++    }
++    pub(crate) fn refill(&self, user: &str, limit: u64) -> io::Result<()> {
++        self.refill_at(user, limit, &month_now())
++    }
++    fn refill_at(&self, user: &str, limit: u64, month: &str) -> io::Result<()> {
++        let mut book = self.book.lock().unwrap();
++        Self::healthy(&book, month)?;
++        if month > book.month.as_str() {
++            let oldest = cutoff(month);
++            book.entries
++                .retain(|(m, _), e| m >= &oldest || e.in_flight > 0);
++            book.month = month.into();
++            self.append(
++                &mut book,
++                Event::Month {
++                    month: month.into(),
++                },
++            )?;
++        }
++        let key = (month.into(), user.into());
++        let entry = book.entries.entry(key.clone()).or_insert_with(|| Entry {
++            record: UsageRecord {
++                user_id: user.into(),
++                month: month.into(),
++                ..Default::default()
++            },
++            available: 0,
++            in_flight: 0,
++            dirty: false,
++        });
++        let credit = CREDIT_BYTES.saturating_sub(entry.available);
++        let amount = if limit == 0 {
++            credit
++        } else {
++            limit
++                .saturating_sub(entry.record.reserved_bytes)
++                .min(credit)
++        };
++        if amount == 0 {
++            return Ok(());
++        }
++        entry.record.reserved_bytes = entry
++            .record
++            .reserved_bytes
++            .checked_add(amount)
++            .ok_or_else(invalid)?;
++        entry.available += amount;
++        let record = entry.record.clone();
++        self.append(&mut book, Event::Usage { record })?;
++        book.entries.get_mut(&key).unwrap().dirty = false;
++        Ok(())
++    }
++    pub fn checkpoint(&self) -> io::Result<()> {
++        let mut book = self.book.lock().unwrap();
++        Self::healthy(&book, &month_now())?;
++        let keys: Vec<_> = book
++            .entries
++            .iter()
++            .filter(|(_, e)| e.available > 0 || e.dirty)
++            .map(|(k, _)| k.clone())
++            .collect();
++        for key in keys {
++            let e = book.entries.get_mut(&key).unwrap();
++            e.record.reserved_bytes -= e.available;
++            e.available = 0;
++            e.dirty = false;
++            let record = e.record.clone();
++            self.append(&mut book, Event::Usage { record })?;
++        }
++        Ok(())
++    }
++    pub fn snapshot(&self) -> io::Result<UsageSnapshot> {
++        let month = month_now();
++        let book = self.book.lock().unwrap();
++        Self::healthy(&book, &month)?;
++        Ok(UsageSnapshot {
++            month,
++            started_at: book.started_at.clone(),
++            credit_bytes: CREDIT_BYTES,
++            records: book
++                .entries
++                .values()
++                .map(|e| {
++                    let charged = e.record.reserved_bytes - e.available - e.in_flight;
++                    UsageView {
++                        record: e.record.clone(),
++                        charged_bytes: charged,
++                        in_flight_bytes: e.in_flight,
++                        uncertain_bytes: charged - e.record.upload_bytes - e.record.download_bytes,
++                    }
++                })
++                .collect(),
++        })
++    }
++}
++impl Credit {
++    pub fn commit(mut self, sent: usize) {
++        assert!(sent <= self.bytes);
++        self.finish(sent);
++        self.settled = true;
++    }
++    fn finish(&mut self, sent: usize) {
++        let mut book = self.ledger.book.lock().unwrap();
++        let entry = book.entries.get_mut(&self.key).unwrap();
++        entry.in_flight -= self.bytes as u64;
++        entry.available += (self.bytes - sent) as u64;
++        entry.dirty |= sent > 0;
++        if self.upload {
++            entry.record.upload_bytes += sent as u64;
++        } else {
++            entry.record.download_bytes += sent as u64;
++        }
++    }
++}
++impl Drop for Credit {
++    fn drop(&mut self) {
++        if !self.settled {
++            self.finish(0);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn open(dir: &tempfile::TempDir) -> Arc<UsageLedger> {
++        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        UsageLedger::open_at(&dir.path().join("usage.jsonl"), true, "2026-01").unwrap()
++    }
++    fn grant(
++        book: &Arc<UsageLedger>,
++        limit: u64,
++        n: usize,
++        upload: bool,
++        whole: bool,
++    ) -> Option<Credit> {
++        loop {
++            match book
++                .try_credit_at("alice", limit, n, upload, whole, "2026-01")
++                .unwrap()
++            {
++                Attempt::Granted(c) => return Some(c),
++                Attempt::Exhausted => return None,
++                Attempt::Persist => book.refill_at("alice", limit, "2026-01").unwrap(),
++            }
++        }
++    }
++    #[test]
++    fn directions_and_parallel_reservations_share_one_budget() {
++        let dir = tempfile::tempdir().unwrap();
++        let book = open(&dir);
++        let a = grant(&book, 100, 60, true, false).unwrap();
++        let b = grant(&book, 100, 60, false, false).unwrap();
++        assert_eq!(b.bytes, 40);
++        assert!(grant(&book, 100, 1, true, false).is_none());
++        a.commit(50);
++        b.commit(40);
++        let c = grant(&book, 100, 100, false, false).unwrap();
++        assert_eq!(c.bytes, 10);
++        c.commit(10);
++        assert!(grant(&book, 100, 1, true, false).is_none());
++        let view = book.snapshot().unwrap();
++        assert_eq!(view.records[0].charged_bytes, 100);
++        assert_eq!(view.records[0].record.upload_bytes, 50);
++        assert_eq!(view.records[0].record.download_bytes, 50);
++    }
++    #[test]
++    fn concurrent_threads_cannot_multiply_credit() {
++        let dir = tempfile::tempdir().unwrap();
++        let book = open(&dir);
++        let workers: Vec<_> = (0..24)
++            .map(|_| {
++                let book = book.clone();
++                std::thread::spawn(move || {
++                    let mut sum = 0;
++                    while let Some(c) = grant(&book, 100000, 16384, false, false) {
++                        let n = c.bytes;
++                        sum += n;
++                        c.commit(n);
++                    }
++                    sum
++                })
++            })
++            .collect();
++        let sent: usize = workers.into_iter().map(|w| w.join().unwrap()).sum();
++        assert_eq!(sent, 100000);
++        assert_eq!(book.snapshot().unwrap().records[0].charged_bytes, 100000);
++    }
++    #[test]
++    fn cancelled_writes_and_whole_datagrams_do_not_lose_budget() {
++        let dir = tempfile::tempdir().unwrap();
++        let book = open(&dir);
++        drop(grant(&book, 100, 90, false, false).unwrap());
++        assert!(grant(&book, 100, 101, true, true).is_none());
++        grant(&book, 100, 100, false, true).unwrap().commit(100);
++        assert!(grant(&book, 100, 1, false, false).is_none());
++    }
++    #[test]
++    fn restart_forfeits_only_the_bounded_unused_credit() {
++        let dir = tempfile::tempdir().unwrap();
++        let book = open(&dir);
++        grant(&book, 2 * CREDIT_BYTES, 100, false, false)
++            .unwrap()
++            .commit(100);
++        assert_eq!(book.snapshot().unwrap().records[0].charged_bytes, 100);
++        drop(book);
++        let book = open(&dir);
++        let view = book.snapshot().unwrap();
++        assert_eq!(view.records[0].charged_bytes, CREDIT_BYTES);
++        assert_eq!(view.records[0].uncertain_bytes, CREDIT_BYTES);
++        grant(&book, 2 * CREDIT_BYTES, CREDIT_BYTES as usize, true, false)
++            .unwrap()
++            .commit(CREDIT_BYTES as usize);
++        assert!(grant(&book, 2 * CREDIT_BYTES, 1, true, false).is_none());
++    }
++    #[test]
++    fn checkpoint_makes_idle_usage_exact_and_keeps_inflight_credit() {
++        let dir = tempfile::tempdir().unwrap();
++        let book = open(&dir);
++        grant(&book, 1000, 100, true, false).unwrap().commit(100);
++        let pending = grant(&book, 1000, 50, false, false).unwrap();
++        book.checkpoint().unwrap();
++        pending.commit(30);
++        book.checkpoint().unwrap();
++        drop(book);
++        let book = open(&dir);
++        let v = book.snapshot().unwrap();
++        assert_eq!(v.records[0].charged_bytes, 130);
++        assert_eq!(v.records[0].uncertain_bytes, 0);
++    }
++    #[test]
++    fn checkpoint_preserves_direction_totals_when_quota_is_exactly_exhausted() {
++        let dir = tempfile::tempdir().unwrap();
++        let book = open(&dir);
++        grant(&book, 100, 100, true, false).unwrap().commit(100);
++        book.checkpoint().unwrap();
++        drop(book);
++        let book = open(&dir);
++        let snapshot = book.snapshot().unwrap();
++        assert_eq!(snapshot.records[0].record.upload_bytes, 100);
++        assert_eq!(snapshot.records[0].uncertain_bytes, 0);
++    }
++    #[test]
++    fn changing_limit_does_not_reset_spending() {
++        let dir = tempfile::tempdir().unwrap();
++        let book = open(&dir);
++        grant(&book, 0, 80, true, false).unwrap().commit(80);
++        assert!(grant(&book, 50, 1, false, false).is_none());
++        let c = grant(&book, 100, 40, false, false).unwrap();
++        assert_eq!(c.bytes, 20);
++        c.commit(20);
++        assert!(grant(&book, 100, 1, false, false).is_none());
++        grant(&book, 200, 10, false, false).unwrap().commit(10);
++        assert_eq!(book.snapshot().unwrap().records[0].charged_bytes, 110);
++    }
++    #[test]
++    fn month_rollover_retains_history_and_refuses_clock_rollback() {
++        let dir = tempfile::tempdir().unwrap();
++        let book = open(&dir);
++        grant(&book, 100, 100, false, false).unwrap().commit(100);
++        book.refill_at("alice", 100, "2026-02").unwrap();
++        let Attempt::Granted(c) = book
++            .try_credit_at("alice", 100, 100, true, false, "2026-02")
++            .unwrap()
++        else {
++            panic!("new month has no credit")
++        };
++        c.commit(100);
++        assert!(book
++            .try_credit_at("alice", 100, 1, false, false, "2026-01")
++            .is_err());
++        assert_eq!(book.snapshot().unwrap().records.len(), 2);
++        drop(book);
++        assert!(UsageLedger::open_at(&dir.path().join("usage.jsonl"), false, "2026-01").is_err());
++        let book = UsageLedger::open_at(&dir.path().join("usage.jsonl"), false, "2026-02").unwrap();
++        assert_eq!(book.snapshot().unwrap().records.len(), 2);
++    }
++    #[test]
++    fn missing_torn_corrupt_or_insecure_journals_fail_closed() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("usage.jsonl");
++        assert!(UsageLedger::open(&path, false).is_err());
++        let book = open(&dir);
++        assert!(UsageLedger::open(&path, true).is_err());
++        drop(book);
++        let bytes = std::fs::read(&path).unwrap();
++        std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
++        assert!(UsageLedger::open(&path, true).is_err());
++        std::fs::write(&path, b"{corrupt}\n").unwrap();
++        assert!(UsageLedger::open(&path, true).is_err());
++        std::fs::write(&path, &bytes).unwrap();
++        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
++        assert!(UsageLedger::open(&path, true).is_err());
++    }
++    #[test]
++    fn storage_failure_revokes_future_credit() {
++        let dir = tempfile::tempdir().unwrap();
++        let book = open(&dir);
++        book.book.lock().unwrap().file = File::open(dir.path().join("usage.jsonl")).unwrap();
++        assert!(book.refill_at("alice", 100, "2026-01").is_err());
++        assert!(book.snapshot().is_err());
++        assert!(!book.allowed("alice", 0));
++        assert!(book
++            .try_credit_at("alice", 100, 1, false, false, "2026-01")
++            .is_err());
++    }
++    #[test]
++    fn compaction_replays_the_same_usage_and_retention_is_bounded() {
++        let dir = tempfile::tempdir().unwrap();
++        let book = open(&dir);
++        grant(&book, 100, 50, true, false).unwrap().commit(50);
++        book.checkpoint().unwrap();
++        {
++            let mut inner = book.book.lock().unwrap();
++            inner.bytes = COMPACT_BYTES;
++        }
++        book.refill_at("alice", 100, "2026-01").unwrap();
++        drop(book);
++        let book = open(&dir);
++        assert_eq!(book.snapshot().unwrap().records[0].charged_bytes, 100);
++        book.refill_at("alice", 100, "2028-01").unwrap();
++        assert_eq!(book.book.lock().unwrap().entries.len(), 1);
++    }
++}
+diff --git a/lib/tests/managed.rs b/lib/tests/managed.rs
+index f4caf6d..68ec3ef 100644
+--- a/lib/tests/managed.rs
++++ b/lib/tests/managed.rs
+@@ -98,6 +98,12 @@ async fn transfer(
+ }
+ 
+ fn make_endpoint() -> (SocketAddr, common::File, Arc<Core>) {
++    make_endpoint_with_usage(None, 0)
++}
++fn make_endpoint_with_usage(
++    ledger: Option<Arc<trusttunnel::usage::UsageLedger>>,
++    quota: u64,
++) -> (SocketAddr, common::File, Arc<Core>) {
+     let endpoint = common::make_endpoint_address();
+     let cert = common::make_cert_key_file();
+     let cert_path = cert.path.to_str().unwrap().to_string();
+@@ -134,8 +140,13 @@ fn make_endpoint() -> (SocketAddr, common::File, Arc<Core>) {
+         .build()
+         .unwrap();
+     let core = Arc::new(Core::new(settings, Some(registry), hosts, Shutdown::new()).unwrap());
++    if let Some(ledger) = ledger {
++        core.traffic_control().set_usage_ledger(ledger).unwrap();
++    }
+     core.traffic_control().replace(&[
+         TrafficPolicy {
++            user_id: "alice".into(),
++            quota_bytes: quota,
+             username: "alice".into(),
+             enabled: true,
+             download_mbps: 2,
+@@ -143,6 +154,8 @@ fn make_endpoint() -> (SocketAddr, common::File, Arc<Core>) {
+             expires_at_unix_ms: None,
+         },
+         TrafficPolicy {
++            user_id: "bob".into(),
++            quota_bytes: 0,
+             username: "bob".into(),
+             enabled: true,
+             download_mbps: 0,
+@@ -273,6 +286,8 @@ fn close_alice(core: &Core, expiry: bool) {
+     if expiry {
+         core.traffic_control().replace(&[
+             TrafficPolicy {
++                user_id: "alice".into(),
++                quota_bytes: 0,
+                 username: "alice".into(),
+                 enabled: true,
+                 download_mbps: 0,
+@@ -280,6 +295,8 @@ fn close_alice(core: &Core, expiry: bool) {
+                 expires_at_unix_ms: Some(chrono::Utc::now().timestamp_millis() + 250),
+             },
+             TrafficPolicy {
++                user_id: "bob".into(),
++                quota_bytes: 0,
+                 username: "bob".into(),
+                 enabled: true,
+                 download_mbps: 0,
+@@ -379,9 +396,18 @@ async fn h3_expiry_closes_idle_transport_without_interrupting_bob() {
+     Box::pin(targeted_kick(true, true)).await;
+ }
+ 
+-async fn udp_expiry(h3: bool) {
++async fn udp_expiry(h3: bool, quota: bool) {
+     use bytes::BufMut;
+-    let (endpoint, cert, core) = make_endpoint();
++    use std::os::unix::fs::PermissionsExt;
++    let dir = tempfile::tempdir().unwrap();
++    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++    let ledger = if quota {
++        Some(trusttunnel::usage::UsageLedger::open(&dir.path().join("usage.jsonl"), true).unwrap())
++    } else {
++        None
++    };
++    let (endpoint, cert, core) =
++        make_endpoint_with_usage(ledger.clone(), if quota { 4 } else { 0 });
+     let server = tokio::spawn({
+         let core = core.clone();
+         async move { core.listen().await.unwrap() }
+@@ -428,7 +454,9 @@ async fn udp_expiry(h3: bool) {
+                 received.extend_from_slice(&chunk[..n]);
+             }
+             assert!(received.ends_with(b"ok"));
+-            close_alice(&core, true);
++            if !quota {
++                close_alice(&core, true);
++            }
+             tokio::time::timeout(Duration::from_secs(3), alice.wait_for_peer_close())
+                 .await
+                 .unwrap();
+@@ -438,7 +466,9 @@ async fn udp_expiry(h3: bool) {
+             let mut ack = [0u8; 42];
+             alice.read_exact(&mut ack).await.unwrap();
+             assert!(ack.ends_with(b"ok"));
+-            close_alice(&core, true);
++            if !quota {
++                close_alice(&core, true);
++            }
+             let result = tokio::time::timeout(Duration::from_secs(3), alice.read(&mut ack))
+                 .await
+                 .unwrap();
+@@ -449,15 +479,98 @@ async fn udp_expiry(h3: bool) {
+     tokio::time::timeout(Duration::from_secs(5), Box::pin(work))
+         .await
+         .unwrap();
++    if let Some(ledger) = ledger {
++        let usage = ledger.snapshot().unwrap();
++        let row = usage
++            .records
++            .iter()
++            .find(|r| r.record.user_id == "alice")
++            .unwrap();
++        assert_eq!(row.charged_bytes, 4);
++        assert_eq!(row.record.upload_bytes, 2);
++        assert_eq!(row.record.download_bytes, 2);
++        assert!(!ledger.allowed("alice", 4));
++    }
+     server.abort();
+     origin_task.abort();
+     drop(cert);
+ }
+ #[tokio::test]
+ async fn h2_expiry_closes_udp_mux_after_real_datagram() {
+-    Box::pin(udp_expiry(false)).await;
++    Box::pin(udp_expiry(false, false)).await;
+ }
+ #[tokio::test]
+ async fn h3_expiry_closes_udp_mux_after_real_datagram() {
+-    Box::pin(udp_expiry(true)).await;
++    Box::pin(udp_expiry(true, false)).await;
++}
++#[tokio::test]
++async fn h2_quota_bills_both_directions_of_real_udp() {
++    Box::pin(udp_expiry(false, true)).await;
++}
++#[tokio::test]
++async fn h3_quota_bills_both_directions_of_real_udp() {
++    Box::pin(udp_expiry(true, true)).await;
++}
++
++async fn shared_quota(h3: bool) {
++    use std::os::unix::fs::PermissionsExt;
++    let dir = tempfile::tempdir().unwrap();
++    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++    let ledger =
++        trusttunnel::usage::UsageLedger::open(&dir.path().join("usage.jsonl"), true).unwrap();
++    let quota = 65536;
++    let (endpoint, cert, core) = make_endpoint_with_usage(Some(ledger.clone()), quota);
++    let server = tokio::spawn({
++        let core = core.clone();
++        async move { core.listen().await.unwrap() }
++    });
++    let origin = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
++    let target = origin.local_addr().unwrap();
++    let peer = tokio::spawn(async move {
++        let mut peers = Vec::new();
++        for _ in 0..3 {
++            peers.push(origin.accept().await.unwrap().0);
++        }
++        for mut stream in peers {
++            tokio::spawn(async move {
++                let _ = stream.write_all(&vec![42; 262144]).await;
++            });
++        }
++    });
++    tokio::time::sleep(Duration::from_millis(200)).await;
++    let work = async {
++        let (a, b, bob) = tokio::join!(
++            Box::pin(transfer(h3, endpoint, target, "alice", false)),
++            Box::pin(transfer(h3, endpoint, target, "alice", false)),
++            Box::pin(transfer(h3, endpoint, target, "bob", false))
++        );
++        assert!(
++            a + b <= quota as usize,
++            "parallel transports bypassed quota"
++        );
++        assert!(a + b > 0);
++        assert_eq!(bob, 262144);
++        let snapshot = ledger.snapshot().unwrap();
++        let usage = snapshot
++            .records
++            .iter()
++            .find(|r| r.record.user_id == "alice")
++            .unwrap();
++        assert_eq!(usage.charged_bytes, quota);
++        assert!(!ledger.allowed("alice", quota));
++    };
++    tokio::time::timeout(Duration::from_secs(8), Box::pin(work))
++        .await
++        .unwrap();
++    server.abort();
++    peer.abort();
++    drop(cert);
++}
++#[tokio::test]
++async fn h2_parallel_transports_share_durable_quota() {
++    Box::pin(shared_quota(false)).await;
++}
++#[tokio::test]
++async fn h3_parallel_transports_share_durable_quota() {
++    Box::pin(shared_quota(true)).await;
+ }

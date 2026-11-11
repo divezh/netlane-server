@@ -1,0 +1,26 @@
+[Unit]
+Description=Netlane Console
+After=network.target
+ConditionPathExists=/etc/trusttunnel-admin/config.json
+
+[Service]
+Type=simple
+User=trusttunnel-admin
+Group=trusttunnel-admin
+ExecStart=/usr/bin/trusttunnel-admin serve --config /etc/trusttunnel-admin/config.json
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# The panel rewrites config.json when the administrator changes the password.
+ReadWritePaths=/var/lib/trusttunnel-admin /etc/trusttunnel-admin
+
+[Install]
+WantedBy=multi-user.target

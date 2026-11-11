@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><meta name="theme-color" content="#080c16"><title>Netlane Console</title><link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48"><link rel="icon" type="image/png" href="/icon.png" sizes="128x128"><link rel="stylesheet" href="/app.css"><script src="/app.js" defer></script></head>
+<body>
+<section id="login-screen" class="login-screen"><form id="login-form" class="login-panel">
+<div class="brand"><img src="/icon.png" alt="" width="29" height="29">Netlane Console</div>
+<h1>Вход в панель</h1><p>VPN · пользователи и серверы</p>
+<div id="login-credentials"><label>Логин<input name="username" autocomplete="username" required value="admin"></label>
+<label>Пароль<input name="password" type="password" autocomplete="current-password" required></label>
+</div>
+<div id="login-factor" hidden>
+<label>Код из приложения или резервный код<input name="code" autocomplete="one-time-code" maxlength="64" spellcheck="false"></label>
+<button id="login-factor-back" type="button">Вернуться к паролю</button>
+</div>
+<p id="login-error" class="error" role="alert"></p><button class="primary" type="submit">Войти</button>
+</form></section>
+<div id="workspace" hidden>
+<aside>
+<a href="#overview" class="brand"><img src="/icon.png" alt="" width="29" height="29">Netlane Console</a>
+<nav aria-label="Основная навигация">
+<a href="#overview"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z"/></svg>Обзор</a>
+<a href="#users"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2 M13 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0 M22 21v-2a4 4 0 0 0-3-4 M17 3a4 4 0 0 1 0 8"/></svg>Пользователи</a>
+<a href="#groups"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5z M3 13l9 5 9-5"/></svg>Группы</a>
+<a href="#nodes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 7v5m-7 5v-5h14v5 M9 3h6v4H9z M2 17h6v4H2z M16 17h6v4h-6z"/></svg>Ноды</a>
+<a href="#server"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4h18v6H3z M3 14h18v6H3z M7 7h1m-1 10h1"/></svg>Сервер</a>
+<a href="#audit"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h12v18H6z M9 8h6m-6 4h6m-6 4h6"/></svg>Журнал</a>
+<a href="#routing"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v16m0-8h8m0 0 7-7m-7 7 7 7M15 5h4v4m0 6v4h-4"/></svg>Маршрутизация</a>
+<a href="#security"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-11V5l-8-3-8 3v6c0 7 8 11 8 11z M9 12l2 2 4-4"/></svg>Безопасность</a>
+</nav>
+<p id="panel-version" class="aside-version"></p>
+<div class="aside-foot"><span id="admin-name">admin</span><button id="logout" type="button">Выйти</button></div>
+</aside>
+<main><header><div><h1 id="page-title">Обзор</h1><p id="page-caption">Подключение к серверу…</p></div><div class="actions"><button id="refresh">Обновить</button><button id="create-user" class="primary">Создать пользователя</button></div></header>
+<p id="page-error" class="error" role="alert" hidden></p><p id="notice" role="status" hidden></p>
+<div id="content" aria-live="polite"><p class="empty">Загружаем состояние сервера…</p></div>
+</main></div>
+<dialog id="editor" aria-labelledby="editor-title"><form id="user-form"><div class="dialog-head"><h2 id="editor-title">Новый пользователь</h2><button type="button" data-close="editor" aria-label="Закрыть">×</button></div>
+<label>Имя пользователя<input name="username" required pattern="[a-zA-Z0-9][a-zA-Z0-9_\-]{0,63}" maxlength="64" autocomplete="off"><small>Латинские буквы, цифры, дефис и подчёркивание.</small></label>
+<label>Группа<select name="group" required></select><small>Группа определяет, какие локации доступны пользователю. Перевести в другую можно в любой момент.</small></label>
+<fieldset class="user-editor-section"><legend>Доступ</legend>
+<label class="check"><input name="enabled" type="checkbox" checked>Разрешить подключение</label><p class="hint">Отключение завершит активные сессии и запретит новые подключения.</p>
+<label>Доступ до<input name="expires" type="datetime-local" step="1"><small id="expiry-hint">Время в часовом поясе устройства. Пустое поле — без срока.</small></label>
+<div class="actions expiry-actions"><button type="button" data-expiry-days="7">+7 дней</button><button type="button" data-expiry-days="30">+30 дней</button><button type="button" id="clear-expiry">Без срока</button></div>
+</fieldset>
+<fieldset class="user-editor-section"><legend>Скорость и трафик</legend>
+<div class="fields speed-fields"><label>Загрузка, Мбит/с<input name="download" type="number" min="0" max="1000000" step="1" required value="0"></label><label>Отдача, Мбит/с<input name="upload" type="number" min="0" max="1000000" step="1" required value="0"></label></div>
+<p class="hint">0 — без ограничения скорости. Лимит общий для всех сессий пользователя.</p>
+<label id="quota-field">Месячная квота, ГиБ<input name="quota" type="number" min="0" max="1048576" step="any" required value="0"><small id="quota-hint">0 — без лимита. 1 ГиБ = 1 073 741 824 байта. Изменение лимита не обнуляет расход.</small></label>
+</fieldset>
+<p id="policy-note" class="hint"></p><p id="editor-error" class="error" role="alert"></p><div class="dialog-actions editor-actions"><button type="button" id="delete-user" class="danger" hidden>Удалить пользователя</button><div class="editor-save-actions"><button type="button" data-close="editor">Отмена</button><button type="submit" class="primary">Сохранить и применить</button></div></div></form></dialog>
+<dialog id="bulk-delete-confirm" aria-labelledby="bulk-delete-title" aria-describedby="bulk-delete-description"><form id="bulk-delete-form"><div class="dialog-head"><h2 id="bulk-delete-title">Удалить выбранных пользователей?</h2><button type="button" data-close="bulk-delete-confirm" aria-label="Закрыть">×</button></div><p id="bulk-delete-description"></p><p class="hint">Активные сессии завершатся, старые профили перестанут работать. История трафика и журнал действий сохранятся по ID. Восстановить доступ после удаления нельзя.</p><p id="bulk-delete-error" class="error" role="alert"></p><div class="dialog-actions"><button type="button" data-close="bulk-delete-confirm" autofocus>Отмена</button><button type="submit" class="danger">Удалить выбранных</button></div></form></dialog>
+<dialog id="group-editor" aria-labelledby="group-editor-title"><form id="group-form"><div class="dialog-head"><h2 id="group-editor-title">Новая группа</h2><button type="button" data-close="group-editor" aria-label="Закрыть">×</button></div>
+<label>Название<input name="name" required maxlength="40" autocomplete="off"><small>До 40 символов. Название видно только в панели.</small></label>
+<fieldset class="user-editor-section"><legend>Локации</legend>
+<p class="hint">Отметьте локации, доступные участникам. Если не отмечено ничего, доступны все локации, включая добавленные позже. Главный сервер доступен всегда.</p>
+<div id="group-locations" class="check-list"></div>
+</fieldset>
+<p id="group-error" class="error" role="alert"></p><div class="dialog-actions editor-actions"><button type="button" id="delete-group" class="danger" hidden>Удалить группу</button><div class="editor-save-actions"><button type="button" data-close="group-editor">Отмена</button><button type="submit" class="primary">Сохранить</button></div></div></form></dialog>
+<dialog id="delete-confirm" aria-labelledby="delete-title" aria-describedby="delete-description"><form id="delete-form"><div class="dialog-head"><h2 id="delete-title">Удалить пользователя?</h2><button type="button" data-close="delete-confirm" aria-label="Закрыть">×</button></div><p id="delete-description"></p><p class="hint">Активные сессии завершатся, старые профили перестанут работать. История трафика и журнал действий сохранятся по ID. Восстановить этот доступ после удаления нельзя.</p><p id="delete-error" class="error" role="alert"></p><div class="dialog-actions"><button type="button" data-close="delete-confirm" autofocus>Отмена</button><button type="submit" class="danger">Удалить пользователя</button></div></form></dialog>
+<dialog id="shared-rule-editor" aria-labelledby="shared-rule-title"><form id="shared-rule-form">
+<div class="dialog-head"><h2 id="shared-rule-title">Набор правил</h2><button type="button" data-close="shared-rule-editor" aria-label="Закрыть">×</button></div>
+<label>Название<input name="name" required maxlength="40"></label>
+<label>Режим<select name="mode"><option value="selective">Только указанные адреса через VPN</option><option value="general">Весь трафик через VPN, указанные адреса напрямую</option></select></label>
+<label>Домены, IPv4 и CIDR<textarea name="destinations" rows="6" placeholder="example.com&#10;*.example.org&#10;203.0.113.0/24"></textarea><small>По одному адресу на строку. До 256 адресов.</small></label>
+<label>Приложения<textarea name="applications" rows="4" placeholder="vpn telegram.exe&#10;direct browser.exe"></textarea><small>По одному правилу на строку. Маршрут vpn или direct, затем имя процесса .exe. До 100 приложений.</small></label>
+<p id="shared-rule-error" class="error" role="alert"></p>
+<div class="dialog-actions"><button type="button" data-close="shared-rule-editor">Отмена</button><button type="submit" class="primary">Добавить в настройки</button></div>
+</form></dialog>
+<dialog id="factor-dialog" aria-labelledby="factor-title"><form id="factor-form">
+<div class="dialog-head"><h2 id="factor-title">Настройка 2FA</h2><button type="button" data-close="factor-dialog" aria-label="Закрыть">×</button></div>
+<div id="factor-setup" hidden><p>Отсканируйте QR-код приложением-аутентификатором или введите ключ вручную: код по времени, 6 цифр, интервал 30 секунд.</p><img id="factor-qr" class="qr" alt="QR-код для приложения-аутентификатора" hidden><label>Ключ настройки<input id="factor-secret" readonly spellcheck="false"></label></div>
+<label>Текущий пароль<input type="password" name="password" autocomplete="current-password" required></label>
+<label><span id="factor-code-label">Код из приложения</span><input name="code" autocomplete="one-time-code" required maxlength="64" spellcheck="false"></label>
+<p id="factor-error" class="error" role="alert"></p>
+<div class="dialog-actions"><button type="button" data-close="factor-dialog">Отмена</button><button class="primary" type="submit" id="factor-submit">Подтвердить</button></div>
+</form></dialog>
+<dialog id="factor-recovery" aria-labelledby="recovery-title">
+<div class="dialog-head"><h2 id="recovery-title">Резервные коды</h2><button type="button" data-close="factor-recovery" aria-label="Закрыть">×</button></div>
+<p>Сохраните коды отдельно от пароля. Каждый код действует один раз и показывается только сейчас.</p>
+<pre id="factor-codes"></pre><div class="dialog-actions"><button type="button" data-close="factor-recovery" class="primary">Готово</button></div>
+</dialog>
+<dialog id="password-dialog" aria-labelledby="password-title"><form id="password-form"><div class="dialog-head"><h2 id="password-title">Пароль администратора</h2><button type="button" data-close="password-dialog" aria-label="Закрыть">×</button></div><label>Текущий пароль<input name="current" type="password" autocomplete="current-password" required maxlength="1024"></label><label>Новый пароль<input name="next" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"><small>Не короче 12 символов. Остальные открытые сессии панели завершатся.</small></label><label>Повторите новый пароль<input name="confirm" type="password" autocomplete="new-password" required minlength="12" maxlength="1024"></label><p id="password-error" class="error" role="alert"></p><div class="dialog-actions"><button type="button" data-close="password-dialog">Отмена</button><button type="submit" class="primary">Сменить пароль</button></div></form></dialog>
+<dialog id="profile" aria-labelledby="profile-title"><div class="dialog-head"><h2 id="profile-title">Профиль подключения</h2><button data-close="profile" aria-label="Закрыть">×</button></div><p id="profile-user"></p>
+<section id="subscription-area" class="profile-section" aria-labelledby="subscription-title">
+<h3 id="subscription-title">Подписка на все локации</h3>
+<p class="hint">Одна ссылка для приложения Netlane. Список серверов обновляется автоматически.</p>
+<button id="subscription-show" type="button" class="primary">Показать ссылку</button>
+<div id="subscription-result" hidden>
+<label>Ссылка подписки<input id="subscription-url" readonly autocomplete="off"></label><img id="subscription-qr" class="qr" alt="QR-код ссылки подписки" hidden>
+<p class="hint">Ссылка даёт доступ ко всем локациям пользователя.</p>
+<div class="profile-actions"><button id="subscription-copy" type="button" class="primary">Скопировать ссылку</button><button id="subscription-rotate" type="button" hidden>Перевыпустить</button></div>
+</div>
+<p id="subscription-error" class="error" role="status"></p>
+</section>
+<section class="profile-section profile-single" aria-labelledby="single-profile-title">
+<h3 id="single-profile-title">Профиль для этого сервера</h3>
+<p class="hint" id="profile-server"></p>
+<form id="profile-form"><div class="fields"><label>Транспорт<select name="protocol" aria-describedby="transport-hint"><option value="http2">HTTP/2 · TCP</option><option value="http3">HTTP/3 · QUIC / UDP</option></select></label><label class="check"><input name="anti_dpi" type="checkbox" aria-describedby="anti-dpi-summary">Anti-DPI</label></div><p id="transport-hint" class="hint">HTTP/2 — начните с него: соединение через TCP/443, обычно совместимо с большим числом сетей.</p><details class="transport-help"><summary>Чем отличаются транспорты</summary><p>HTTP/2 использует TLS поверх TCP. При потере пакета другие потоки этого TCP-соединения могут ждать его повторной передачи.</p><p>HTTP/3 использует QUIC поверх UDP/443. Потери одного потока не задерживают доставку других на уровне транспорта. Попробуйте на мобильной сети или при потерях; если UDP блокируется или работает хуже, вернитесь к HTTP/2.</p><p>Это способ связи клиента с VPN-сервером: оба варианта переносят TCP- и UDP-трафик приложений. Универсально более быстрого варианта нет.</p></details><details class="transport-help"><summary id="anti-dpi-summary">Когда включать Anti-DPI</summary><p id="anti-dpi-hint">Anti-DPI меняет поведение клиента, чтобы усложнить распознавание VPN системой глубокого анализа пакетов. Попробуйте при обрывах или блокировке соединения. Результат зависит от клиента и сети. Настройка сохраняется в новом профиле.</p></details><button type="submit">Сформировать профиль</button></form>
+<p id="profile-error" class="error" role="alert"></p><section id="profile-result" hidden><label>Ссылка для импорта<input id="profile-link" readonly autocomplete="off"></label><img id="profile-qr" class="qr" alt="QR-код ссылки tt://" hidden><p class="hint">Ссылка и файл содержат пароль VPN. Передавайте их только владельцу доступа.</p><div class="dialog-actions"><button id="copy-profile">Скопировать ссылку</button><button id="download-profile" class="primary">Скачать TOML</button></div></section>
+</section></dialog>
+<dialog id="node-details" aria-labelledby="node-details-title">
+<div class="dialog-head"><div><h2 id="node-details-title">Нода</h2><p id="node-details-domain" class="muted"></p></div><button type="button" data-close="node-details" aria-label="Закрыть">×</button></div>
+<div class="node-detail-controls"><div class="node-detail-tabs" role="group" aria-label="Раздел ноды">
+<button type="button" data-node-tab="status" aria-pressed="true">Состояние</button>
+<button type="button" data-node-tab="users" aria-pressed="false">Пользователи</button>
+<button type="button" data-node-tab="traffic" aria-pressed="false">Трафик</button>
+</div><button type="button" id="node-detail-refresh">Обновить</button></div>
+<div id="node-detail-body" aria-live="polite"></div>
+</dialog>
+<dialog id="node-groups" aria-labelledby="node-groups-title"><form id="node-groups-form"><div class="dialog-head"><div><h2 id="node-groups-title">Группы ноды</h2><p id="node-groups-domain" class="muted"></p></div><button type="button" data-close="node-groups" aria-label="Закрыть">×</button></div><p class="hint">Отметьте группы, которым доступна эта локация. Группа без локаций охватывает все ноды, поэтому исключить её нельзя: задайте ей явные локации в разделе «Группы». Изменение затронет всех участников группы.</p><div id="node-groups-list" class="check-list"></div><p id="node-groups-error" class="error" role="alert"></p><div class="dialog-actions"><button type="button" data-close="node-groups">Отмена</button><button type="submit" class="primary">Сохранить</button></div></form></dialog>
+<dialog id="node-invite" aria-labelledby="node-invite-title"><div class="dialog-head"><h2 id="node-invite-title">Добавить ноду</h2><button data-close="node-invite" aria-label="Закрыть">×</button></div><p>На новом VPS (Ubuntu 24.04/26.04 или Debian 13) загрузите в <code>/root</code> файлы <code>trusttunnel-dev.tar.gz</code> и <code>trusttunnel-dev.tar.gz.sha256</code> из релиза и выполните от root:</p><label>Команда<textarea id="node-command" readonly rows="4" spellcheck="false"></textarea></label><p id="node-expires" class="hint"></p><p class="hint">Нода поставит VPN, маскировку и сертификат, подключится к этому серверу и получит всех пользователей. Нужен свой домен, указывающий на IP ноды. На VPS не должно быть существующей установки панели или ноды: главный сервер этой командой не преобразуется в ноду.</p><p id="node-invite-error" class="error" role="alert"></p><div class="dialog-actions"><button type="button" data-close="node-invite">Закрыть</button><button id="node-copy" type="button" class="primary">Скопировать команду</button></div></dialog>
+<dialog id="node-edit" aria-labelledby="node-edit-title"><form id="node-edit-form"><div class="dialog-head"><div><h2 id="node-edit-title">Изменить ноду</h2><p id="node-edit-domain" class="muted"></p></div><button type="button" data-close="node-edit" aria-label="Закрыть">×</button></div><div class="fields"><label>Название<input name="name" maxlength="64" autocomplete="off"><small>Так локация называется в клиентах. Пусто — клиенты показывают домен.</small></label><label>Страна<input name="country" maxlength="2" pattern="[A-Za-z]{2}" placeholder="DE" autocomplete="off"><small>Код ISO из двух букв, по нему рисуется флаг.</small></label></div><p class="hint">Клиенты увидят новое название при следующем обновлении подписки; выбранная локация у них сохранится.</p><p id="node-edit-error" class="error" role="alert"></p><div class="dialog-actions"><button type="button" data-close="node-edit">Отмена</button><button type="submit" class="primary">Сохранить</button></div></form></dialog>
+<dialog id="node-delete" aria-labelledby="node-delete-title"><form id="node-delete-form"><div class="dialog-head"><h2 id="node-delete-title">Удалить ноду?</h2><button type="button" data-close="node-delete" aria-label="Закрыть">×</button></div><p id="node-delete-description"></p><p class="hint">Нода перестанет пускать пользователей и пропадёт из подписок. Вернуть её можно только новой установкой с кодом приглашения.</p><p id="node-delete-error" class="error" role="alert"></p><div class="dialog-actions"><button type="button" data-close="node-delete" autofocus>Отмена</button><button type="submit" class="danger">Удалить ноду</button></div></form></dialog>
+</body></html>

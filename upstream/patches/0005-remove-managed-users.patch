@@ -1,0 +1,190 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index bab7fe4..be00af0 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+ 
+ ## [Unreleased]
+ 
++- [Feature] Managed `remove` revokes sessions and credentials durably by user ID
++  with generation/revision checks while preserving monthly usage history.
++
+ - [Feature] Managed `quota_bytes` enforces a shared UTC monthly traffic budget
+   with a durable usage journal, 24-month history and fail-closed crash recovery.
+ 
+diff --git a/endpoint/src/main.rs b/endpoint/src/main.rs
+index af3a8b3..4c1bef1 100644
+--- a/endpoint/src/main.rs
++++ b/endpoint/src/main.rs
+@@ -15,7 +15,7 @@ use trusttunnel::shutdown::Shutdown;
+ use trusttunnel::{log_utils, settings};
+ mod management;
+ 
+-const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.4");
++const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.5");
+ const VERSION_PARAM_NAME: &str = "v_e_r_s_i_o_n_do_not_change_this_name_it_will_break";
+ const LOG_LEVEL_PARAM_NAME: &str = "log_level";
+ const LOG_FILE_PARAM_NAME: &str = "log_file";
+diff --git a/endpoint/src/management.rs b/endpoint/src/management.rs
+index ad625cc..2f24a4c 100644
+--- a/endpoint/src/management.rs
++++ b/endpoint/src/management.rs
+@@ -55,6 +55,12 @@ enum Request {
+         expected_generation: u64,
+         user: ManagedUser,
+     },
++    Remove {
++        expected_generation: u64,
++        id: String,
++        username: String,
++        expected_revision: u64,
++    },
+     Disconnect {
+         username: String,
+     },
+@@ -92,6 +98,37 @@ fn secure_parent(path: &Path) -> io::Result<()> {
+     Ok(())
+ }
+ impl State {
++    fn removed(
++        &self,
++        generation: u64,
++        id: &str,
++        username: &str,
++        revision: u64,
++    ) -> Result<Self, &'static str> {
++        if generation != self.generation {
++            return Err("generation_conflict");
++        }
++        if id.is_empty()
++            || id.len() > 128
++            || username.is_empty()
++            || username.len() > 64
++            || revision == 0
++        {
++            return Err("invalid_user");
++        }
++        let mut next = self.clone();
++        if let Some(old) = self.users.iter().find(|u| u.id == id) {
++            if old.username != username || old.revision != revision {
++                return Err("revision_conflict");
++            }
++            next.users.retain(|u| u.id != id);
++            next.generation = self
++                .generation
++                .checked_add(1)
++                .ok_or("generation_exhausted")?;
++        }
++        Ok(next)
++    }
+     pub fn load_or_import(path: &Path, clients: &[Client]) -> io::Result<Self> {
+         if !path.is_absolute() {
+             return Err(invalid());
+@@ -182,7 +219,7 @@ impl State {
+         std::fs::File::open(parent)?.sync_all()
+     }
+     fn public(&self) -> serde_json::Value {
+-        serde_json::json!({"version":1,"generation":self.generation,"capabilities":{"hot_reload":true,"disconnect_user":true,"speed_limits":true,"durable_quotas":true,"expiry":true},"users":self.users.iter().map(|u|serde_json::json!({"id":u.id,"username":u.username,"revision":u.revision,"enabled":u.enabled,"download_mbps":u.download_mbps,"upload_mbps":u.upload_mbps,"quota_bytes":u.quota_bytes,"expires_at":u.expires_at,"expired":expiry_millis(u.expires_at.as_deref()).ok().flatten().is_some_and(|at| chrono::Utc::now().timestamp_millis() >= at)})).collect::<Vec<_>>()})
++        serde_json::json!({"version":1,"generation":self.generation,"capabilities":{"hot_reload":true,"disconnect_user":true,"remove_user":true,"speed_limits":true,"durable_quotas":true,"expiry":true},"users":self.users.iter().map(|u|serde_json::json!({"id":u.id,"username":u.username,"revision":u.revision,"enabled":u.enabled,"download_mbps":u.download_mbps,"upload_mbps":u.upload_mbps,"quota_bytes":u.quota_bytes,"expires_at":u.expires_at,"expired":expiry_millis(u.expires_at.as_deref()).ok().flatten().is_some_and(|at| chrono::Utc::now().timestamp_millis() >= at)})).collect::<Vec<_>>()})
+     }
+ }
+ impl Management {
+@@ -236,6 +273,38 @@ impl Management {
+         match request {
+             Request::Status => self.reply(&state),
+             Request::Usage { month, after } => self.usage_reply(&month, &after),
++            Request::Remove {
++                expected_generation,
++                id,
++                username,
++                expected_revision,
++            } => {
++                let next =
++                    match state.removed(expected_generation, &id, &username, expected_revision) {
++                        Ok(next) => next,
++                        Err(error) => return serde_json::json!({"ok":false,"error":error}),
++                    };
++                let durable = next.persist(&self.path).is_ok();
++                if !durable {
++                    let committed =
++                        State::load_or_import(&self.path, &[])
++                            .ok()
++                            .is_some_and(|saved| {
++                                serde_json::to_vec(&saved).ok() == serde_json::to_vec(&next).ok()
++                            });
++                    if !committed {
++                        return serde_json::json!({"ok":false,"error":"state_write_failed"});
++                    }
++                }
++                if self.apply(&next).is_err() {
++                    return serde_json::json!({"ok":false,"error":"apply_failed"});
++                }
++                *state = next;
++                if !durable {
++                    return serde_json::json!({"ok":false,"error":"state_durability_uncertain"});
++                }
++                self.reply(&state)
++            }
+             Request::Disconnect { username } => {
+                 if !state.users.iter().any(|u| u.username == username) {
+                     return serde_json::json!({"ok":false,"error":"user_not_found"});
+@@ -472,6 +541,59 @@ impl Drop for SocketGuard {
+ mod tests {
+     use super::*;
+     #[test]
++    fn removal_is_versioned_durable_and_safe_when_names_are_reused() {
++        let dir = tempfile::tempdir().unwrap();
++        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        let path = dir.path().join("state.json");
++        let mut state = State {
++            version: 1,
++            usage_version: 1,
++            generation: 3,
++            users: vec![ManagedUser {
++                id: "old-id".into(),
++                username: "alice".into(),
++                password: "test-password".into(),
++                enabled: true,
++                download_mbps: 0,
++                upload_mbps: 0,
++                expires_at: None,
++                quota_bytes: 0,
++                revision: 2,
++                max_http2_conns: None,
++                max_http3_conns: None,
++            }],
++        };
++        assert_eq!(
++            state.removed(2, "old-id", "alice", 2).err(),
++            Some("generation_conflict")
++        );
++        assert_eq!(
++            state.removed(3, "old-id", "bob", 2).err(),
++            Some("revision_conflict")
++        );
++        assert_eq!(
++            state.removed(3, "old-id", "alice", 1).err(),
++            Some("revision_conflict")
++        );
++        assert_eq!(state.removed(3, "", "alice", 2).err(), Some("invalid_user"));
++        state.generation = u64::MAX;
++        assert_eq!(
++            state.removed(u64::MAX, "old-id", "alice", 2).err(),
++            Some("generation_exhausted")
++        );
++        state.generation = 3;
++        let removed = state.removed(3, "old-id", "alice", 2).unwrap();
++        assert_eq!(removed.generation, 4);
++        assert!(removed.users.is_empty());
++        removed.persist(&path).unwrap();
++        assert!(State::load_or_import(&path, &[]).unwrap().users.is_empty());
++        state.users[0].id = "new-id".into();
++        let retried = state.removed(3, "old-id", "alice", 2).unwrap();
++        assert_eq!(retried.generation, 3);
++        assert_eq!(retried.users[0].id, "new-id");
++        assert!(serde_json::from_str::<Request>(r#"{"op":"remove","id":"old-id"}"#).is_err());
++    }
++    #[test]
+     fn largest_status_stays_within_rpc_response_bound() {
+         let state = State {
+             version: 1,

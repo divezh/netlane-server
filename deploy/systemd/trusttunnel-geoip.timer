@@ -1,0 +1,12 @@
+[Unit]
+Description=Netlane: monthly refresh of the GeoIP country database
+Documentation=https://github.com/divezh/netlane/blob/main/docs/GEOIP.md
+
+[Timer]
+# DB-IP publishes a new build on the first of each month.
+OnCalendar=*-*-02 04:30:00
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

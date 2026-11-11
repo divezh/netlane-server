@@ -1,0 +1,1835 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 620b04d..a35cb1f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3575,6 +3575,9 @@ dependencies = [
+  "nix 0.28.0",
+  "rustls",
+  "sentry",
++ "serde",
++ "serde_json",
++ "tempfile",
+  "tokio",
+  "toml",
+  "toml_edit 0.19.15",
+diff --git a/endpoint/Cargo.toml b/endpoint/Cargo.toml
+index a1605e5..83dd5b1 100644
+--- a/endpoint/Cargo.toml
++++ b/endpoint/Cargo.toml
+@@ -8,6 +8,9 @@ name = "trusttunnel_endpoint"
+ doctest = false
+ 
+ [dependencies]
++serde = { version = "1", features = ["derive"] }
++serde_json = "1"
++tempfile = "3"
+ clap = "4.5"
+ console-subscriber = { version = "0.1.9", optional = true }
+ hex = "0.4"
+diff --git a/endpoint/src/main.rs b/endpoint/src/main.rs
+index 9d7b365..3da32fb 100644
+--- a/endpoint/src/main.rs
++++ b/endpoint/src/main.rs
+@@ -13,8 +13,9 @@ use trusttunnel::core::Core;
+ use trusttunnel::settings::Settings;
+ use trusttunnel::shutdown::Shutdown;
+ use trusttunnel::{log_utils, settings};
++mod management;
+ 
+-const VERSION_STRING: &str = env!("TRUSTTUNNEL_VERSION");
++const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.2");
+ const VERSION_PARAM_NAME: &str = "v_e_r_s_i_o_n_do_not_change_this_name_it_will_break";
+ const LOG_LEVEL_PARAM_NAME: &str = "log_level";
+ const LOG_FILE_PARAM_NAME: &str = "log_file";
+@@ -178,6 +179,12 @@ fn main() {
+                 .short('n')
+                 .long("name")
+                 .help("Human-readable server display name for the client configuration."),
++            clap::Arg::new("control-socket")
++                .long("control-socket").requires("control-state")
++                .help("Local Unix control socket (managed mode, absolute path)"),
++            clap::Arg::new("control-state")
++                .long("control-state").requires("control-socket")
++                .help("Private persistent managed state file (absolute path)"),
+             clap::Arg::new(DNS_UPSTREAM_PARAM_NAME)
+                 .action(clap::ArgAction::Append)
+                 .requires(CLIENT_CONFIG_PARAM_NAME)
+@@ -514,6 +521,35 @@ fn main() {
+         )
+         .expect("Couldn't create core instance"),
+     );
++    let management = args.get_one::<String>("control-state").map(|path| {
++        let registry = registry
++            .clone()
++            .expect("Managed mode requires credentials at startup");
++        let saved = management::State::load_or_import(Path::new(path), &[]);
++        // The first start imports the configured registry; subsequent starts use the saved state.
++        let state = if Path::new(path).exists() {
++            saved.expect("Couldn't load managed state")
++        } else {
++            let settings: Settings = toml::from_str(
++                &std::fs::read_to_string(settings_path).expect("Couldn't read settings"),
++            )
++            .expect("Couldn't parse settings");
++            management::State::load_or_import(Path::new(path), settings.get_clients())
++                .expect("Couldn't import managed users")
++        };
++        management::Management::new(state, PathBuf::from(path), core.clone(), registry)
++            .expect("Couldn't initialize managed endpoint")
++    });
++    let control_task = {
++        let management = management.clone();
++        let socket = args.get_one::<String>("control-socket").cloned();
++        async move {
++            match (management, socket) {
++                (Some(m), Some(path)) => m.serve(PathBuf::from(path)).await,
++                _ => std::future::pending::<std::io::Result<()>>().await,
++            }
++        }
++    };
+ 
+     let listen_task = {
+         let core = core.clone();
+@@ -525,6 +561,7 @@ fn main() {
+         let tls_hosts_settings_path = tls_hosts_settings_path.clone();
+         let settings_path = settings_path.clone();
+         let registry = registry.clone();
++        let managed = management.is_some();
+         async move {
+             let mut sighup_listener = signal::unix::signal(signal::unix::SignalKind::hangup())
+                 .expect("Couldn't start SIGHUP listener");
+@@ -548,14 +585,14 @@ fn main() {
+                             error!("TLS reload rejected: {}; previous configuration retained", e);
+                             continue;
+                         }
+-                        if let Some(registry) = &registry {
++                        if let Some(registry) = registry.as_ref().filter(|_|!managed) {
+                             core.reload_client_limits(settings.get_clients());
+                             if let Err(e) = registry.replace_clients(settings.get_clients()) {
+                                 error!("Credentials reload rejected: {}", e);
+                                 continue;
+                             }
+                         }
+-                        info!("TLS hosts and client credentials reloaded; existing streams retained");
++                        info!("TLS hosts reloaded; managed credentials are controlled only by the local socket");
+                     }
+                     Err(_) => error!("Reload rejected: invalid or unreadable configuration; previous state retained"),
+                 }
+@@ -572,6 +609,10 @@ fn main() {
+ 
+     let exit_code = rt.block_on(async move {
+         tokio::select! {
++            result = control_task => {
++                error!("Control listener stopped: {:?}",result.err().map(|e|e.kind()));
++                1
++            },
+             listen_result = listen_task => match listen_result {
+                 Ok(()) => 0,
+                 Err(e) => {
+diff --git a/endpoint/src/management.rs b/endpoint/src/management.rs
+new file mode 100644
+index 0000000..9374eb5
+--- /dev/null
++++ b/endpoint/src/management.rs
+@@ -0,0 +1,379 @@
++//! Version 1: one bounded JSON line per Unix connection. No public TCP listener.
++use serde::{Deserialize, Serialize};
++use std::collections::HashSet;
++use std::io;
++use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++use std::time::Duration;
++use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
++use tokio::net::{UnixListener, UnixStream};
++use tokio::sync::{Mutex, Semaphore};
++use trusttunnel::authentication::registry_based::{Client, RegistryBasedAuthenticator};
++use trusttunnel::core::Core;
++use trusttunnel::traffic_control::TrafficPolicy;
++
++#[derive(Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct ManagedUser {
++    pub id: String,
++    pub username: String,
++    pub password: String,
++    pub enabled: bool,
++    pub download_mbps: u32,
++    pub upload_mbps: u32,
++    pub revision: u64,
++    #[serde(default)]
++    pub max_http2_conns: Option<u32>,
++    #[serde(default)]
++    pub max_http3_conns: Option<u32>,
++}
++#[derive(Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct State {
++    pub version: u32,
++    pub generation: u64,
++    pub users: Vec<ManagedUser>,
++}
++#[derive(Deserialize)]
++#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
++enum Request {
++    Status,
++    Upsert {
++        expected_generation: u64,
++        user: ManagedUser,
++    },
++    Disconnect {
++        username: String,
++    },
++}
++pub struct Management {
++    state: Mutex<State>,
++    path: PathBuf,
++    core: Arc<Core>,
++    registry: Arc<RegistryBasedAuthenticator>,
++}
++fn invalid() -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidData, "invalid managed state")
++}
++fn secure_parent(path: &Path) -> io::Result<()> {
++    let parent = std::fs::metadata(path.parent().ok_or_else(invalid)?)?;
++    if !parent.is_dir() || parent.mode() & 0o027 != 0 {
++        return Err(io::Error::new(
++            io::ErrorKind::PermissionDenied,
++            "managed directory must be 0700 or 0750",
++        ));
++    }
++    Ok(())
++}
++impl State {
++    pub fn load_or_import(path: &Path, clients: &[Client]) -> io::Result<Self> {
++        if !path.is_absolute() {
++            return Err(invalid());
++        }
++        secure_parent(path)?;
++        let state = match std::fs::symlink_metadata(path) {
++            Ok(m) => {
++                if !m.is_file() || m.mode() & 0o077 != 0 || m.len() > 1048576 {
++                    return Err(invalid());
++                }
++                serde_json::from_slice(&std::fs::read(path)?).map_err(|_| invalid())?
++            }
++            Err(e) if e.kind() == io::ErrorKind::NotFound => Self {
++                version: 1,
++                generation: 0,
++                users: clients
++                    .iter()
++                    .map(|c| ManagedUser {
++                        id: format!("legacy:{}", c.username),
++                        username: c.username.clone(),
++                        password: c.password.clone(),
++                        enabled: true,
++                        download_mbps: 0,
++                        upload_mbps: 0,
++                        revision: 1,
++                        max_http2_conns: c.max_http2_conns,
++                        max_http3_conns: c.max_http3_conns,
++                    })
++                    .collect(),
++            },
++            Err(e) => return Err(e),
++        };
++        state.validate()?;
++        Ok(state)
++    }
++    fn validate(&self) -> io::Result<()> {
++        if self.version != 1 || self.users.len() > 100 {
++            return Err(invalid());
++        }
++        let mut names = HashSet::new();
++        let mut ids = HashSet::new();
++        for u in &self.users {
++            if u.id.is_empty()
++                || u.id.len() > 128
++                || u.username.is_empty()
++                || u.username.len() > 64
++                || !u
++                    .username
++                    .bytes()
++                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
++                || u.password.is_empty()
++                || u.password.len() > 1024
++                || u.revision == 0
++                || u.download_mbps > 1000000
++                || u.upload_mbps > 1000000
++                || !names.insert(&u.username)
++                || !ids.insert(&u.id)
++            {
++                return Err(invalid());
++            }
++        }
++        Ok(())
++    }
++    fn clients(&self) -> Vec<Client> {
++        self.users
++            .iter()
++            .filter(|u| u.enabled)
++            .map(|u| Client {
++                username: u.username.clone(),
++                password: u.password.clone(),
++                max_http2_conns: u.max_http2_conns,
++                max_http3_conns: u.max_http3_conns,
++            })
++            .collect()
++    }
++    fn persist(&self, path: &Path) -> io::Result<()> {
++        secure_parent(path)?;
++        let parent = path.parent().ok_or_else(invalid)?;
++        let mut file = tempfile::NamedTempFile::new_in(parent)?;
++        serde_json::to_writer(file.as_file_mut(), self).map_err(|_| invalid())?;
++        file.as_file().sync_all()?;
++        file.persist(path).map_err(|e| e.error)?;
++        std::fs::File::open(parent)?.sync_all()
++    }
++    fn public(&self) -> serde_json::Value {
++        serde_json::json!({"version":1,"generation":self.generation,"capabilities":{"hot_reload":true,"disconnect_user":true,"speed_limits":true,"durable_quotas":false,"expiry":false},"users":self.users.iter().map(|u|serde_json::json!({"id":u.id,"username":u.username,"revision":u.revision,"enabled":u.enabled,"download_mbps":u.download_mbps,"upload_mbps":u.upload_mbps})).collect::<Vec<_>>()})
++    }
++}
++impl Management {
++    pub fn new(
++        state: State,
++        path: PathBuf,
++        core: Arc<Core>,
++        registry: Arc<RegistryBasedAuthenticator>,
++    ) -> io::Result<Arc<Self>> {
++        state.persist(&path)?;
++        let this = Arc::new(Self {
++            state: Mutex::new(state.clone()),
++            path,
++            core,
++            registry,
++        });
++        this.apply(&state)?;
++        Ok(this)
++    }
++    fn apply(&self, state: &State) -> io::Result<()> {
++        let clients = state.clients();
++        RegistryBasedAuthenticator::validate_clients(&clients)?;
++        self.core.traffic_control().replace(
++            &state
++                .users
++                .iter()
++                .map(|u| TrafficPolicy {
++                    username: u.username.clone(),
++                    enabled: u.enabled,
++                    download_mbps: u.download_mbps,
++                    upload_mbps: u.upload_mbps,
++                })
++                .collect::<Vec<_>>(),
++        );
++        self.core.reload_client_limits(&clients);
++        self.registry.replace_clients(&clients)
++    }
++    async fn handle(&self, request: Request) -> serde_json::Value {
++        let mut state = self.state.lock().await;
++        match request {
++            Request::Status => serde_json::json!({"ok":true,"state":state.public()}),
++            Request::Disconnect { username } => {
++                if !state.users.iter().any(|u| u.username == username) {
++                    return serde_json::json!({"ok":false,"error":"user_not_found"});
++                }
++                serde_json::json!({"ok":true,"disconnect_requested":self.core.traffic_control().disconnect(&username)})
++            }
++            Request::Upsert {
++                expected_generation,
++                user,
++            } => {
++                if expected_generation != state.generation {
++                    return serde_json::json!({"ok":false,"error":"generation_conflict"});
++                }
++                let mut next = state.clone();
++                if let Some(old) = next.users.iter_mut().find(|u| u.id == user.id) {
++                    if user.revision < old.revision || old.username != user.username {
++                        return serde_json::json!({"ok":false,"error":"revision_conflict"});
++                    }
++                    if user.revision == old.revision {
++                        if serde_json::to_vec(old).ok() != serde_json::to_vec(&user).ok() {
++                            return serde_json::json!({"ok":false,"error":"revision_conflict"});
++                        }
++                        // Retry the durability barrier after a lost/uncertain acknowledgement.
++                        if state.persist(&self.path).is_err() {
++                            return serde_json::json!({"ok":false,"error":"state_write_failed"});
++                        }
++                        return serde_json::json!({"ok":true,"state":state.public()});
++                    }
++                    *old = user;
++                } else {
++                    if user.password.len() < 12 {
++                        return serde_json::json!({"ok":false,"error":"invalid_user"});
++                    }
++                    next.users.push(user);
++                }
++                if next.validate().is_err() {
++                    return serde_json::json!({"ok":false,"error":"invalid_user"});
++                }
++                next.generation = match next.generation.checked_add(1) {
++                    Some(n) => n,
++                    None => return serde_json::json!({"ok":false,"error":"generation_exhausted"}),
++                };
++                let durable = next.persist(&self.path).is_ok();
++                if !durable {
++                    // A directory fsync can fail after rename. Align live state with the
++                    // committed file, but do not acknowledge durability to the caller.
++                    let committed =
++                        State::load_or_import(&self.path, &[])
++                            .ok()
++                            .is_some_and(|saved| {
++                                serde_json::to_vec(&saved).ok() == serde_json::to_vec(&next).ok()
++                            });
++                    if !committed {
++                        return serde_json::json!({"ok":false,"error":"state_write_failed"});
++                    }
++                }
++                let rotated: Vec<_> = state
++                    .users
++                    .iter()
++                    .filter(|old| {
++                        next.users
++                            .iter()
++                            .any(|u| u.id == old.id && u.password != old.password)
++                    })
++                    .map(|u| u.username.clone())
++                    .collect();
++                if self.apply(&next).is_err() {
++                    return serde_json::json!({"ok":false,"error":"apply_failed"});
++                }
++                for username in rotated {
++                    self.core.traffic_control().disconnect(&username);
++                }
++                *state = next;
++                if !durable {
++                    return serde_json::json!({"ok":false,"error":"state_durability_uncertain"});
++                }
++                serde_json::json!({"ok":true,"state":state.public()})
++            }
++        }
++    }
++    pub async fn serve(self: Arc<Self>, path: PathBuf) -> io::Result<()> {
++        if !path.is_absolute() {
++            return Err(invalid());
++        }
++        secure_parent(&path)?;
++        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
++            if !metadata.file_type().is_socket()
++                || metadata.uid() != unsafe { nix::libc::geteuid() }
++            {
++                return Err(io::ErrorKind::AlreadyExists.into());
++            }
++            match UnixStream::connect(&path).await {
++                Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
++                    std::fs::remove_file(&path)?
++                }
++                _ => return Err(io::ErrorKind::AddrInUse.into()),
++            }
++        }
++        let listener = UnixListener::bind(&path)?;
++        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))?;
++        let _guard = SocketGuard {
++            path: path.clone(),
++            inode: std::fs::symlink_metadata(&path)?.ino(),
++        };
++        let limit = Arc::new(Semaphore::new(16));
++        loop {
++            let permit = limit.clone().acquire_owned().await.map_err(|_| invalid())?;
++            let (stream, _) = listener.accept().await?;
++            let this = self.clone();
++            tokio::spawn(async move {
++                let _permit = permit;
++                let _ = tokio::time::timeout(Duration::from_secs(5), async move {
++                    let (read, mut write) = stream.into_split();
++                    let mut reader = BufReader::new(read).take(65537);
++                    let mut line = Vec::new();
++                    use tokio::io::AsyncReadExt;
++                    reader.read_until(b'\n', &mut line).await?;
++                    let response = if line.len() > 65536 || line.last() != Some(&b'\n') {
++                        serde_json::json!({"ok":false,"error":"invalid_request"})
++                    } else {
++                        match serde_json::from_slice(&line) {
++                            Ok(request) => this.handle(request).await,
++                            Err(_) => serde_json::json!({"ok":false,"error":"invalid_request"}),
++                        }
++                    };
++                    let mut bytes = serde_json::to_vec(&response).map_err(|_| invalid())?;
++                    bytes.push(b'\n');
++                    write.write_all(&bytes).await?;
++                    Ok::<_, io::Error>(())
++                })
++                .await;
++            });
++        }
++    }
++}
++struct SocketGuard {
++    path: PathBuf,
++    inode: u64,
++}
++impl Drop for SocketGuard {
++    fn drop(&mut self) {
++        if std::fs::symlink_metadata(&self.path)
++            .is_ok_and(|m| m.file_type().is_socket() && m.ino() == self.inode)
++        {
++            let _ = std::fs::remove_file(&self.path);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn saved_state_is_private_and_public_response_contains_no_secrets() {
++        let dir = tempfile::tempdir().unwrap();
++        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
++        let path = dir.path().join("state.json");
++        let s = State {
++            version: 1,
++            generation: 3,
++            users: vec![ManagedUser {
++                id: "u1".into(),
++                username: "alice".into(),
++                password: "never-emit-this-password".into(),
++                enabled: true,
++                download_mbps: 2,
++                upload_mbps: 1,
++                revision: 2,
++                max_http2_conns: None,
++                max_http3_conns: None,
++            }],
++        };
++        s.validate().unwrap();
++        s.persist(&path).unwrap();
++        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
++        assert!(!s.public().to_string().contains("never-emit"));
++        let loaded = State::load_or_import(&path, &[]).unwrap();
++        assert_eq!(loaded.generation, 3);
++        assert_eq!(loaded.users[0].download_mbps, 2);
++        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
++        assert!(State::load_or_import(&path, &[]).is_err());
++    }
++}
+diff --git a/lib/Cargo.toml b/lib/Cargo.toml
+index a88a0db..ebf4377 100644
+--- a/lib/Cargo.toml
++++ b/lib/Cargo.toml
+@@ -48,6 +48,7 @@ boring = "4"
+ trusttunnel-deeplink = { path = "../deeplink" }
+ 
+ [dev-dependencies]
++tokio = { version = "1.42", features = ["test-util"] }
+ hyper = { version = "0.14.26", features = ["http1", "http2", "client", "server", "runtime", "stream"] }
+ rustls = { version = "0.23.37", features = ["logging"] }
+ tempfile = "3"
+diff --git a/lib/src/core.rs b/lib/src/core.rs
+index 9b54ce0..1b98ca0 100644
+--- a/lib/src/core.rs
++++ b/lib/src/core.rs
+@@ -83,6 +83,7 @@ pub(crate) struct Context {
+     next_client_id: Arc<AtomicU64>,
+     next_tunnel_id: Arc<AtomicU64>,
+     pub connection_limiter: Option<Arc<ConnectionLimiter>>,
++    pub traffic_control: Arc<crate::traffic_control::TrafficControl>,
+ }
+ 
+ impl Context {
+@@ -161,6 +162,7 @@ impl Core {
+                 next_client_id: Default::default(),
+                 next_tunnel_id: Default::default(),
+                 connection_limiter,
++                traffic_control: Arc::default(),
+             }),
+         })
+     }
+@@ -223,6 +225,10 @@ impl Core {
+         }
+     }
+ 
++    pub fn traffic_control(&self) -> Arc<crate::traffic_control::TrafficControl> {
++        self.context.traffic_control.clone()
++    }
++
+     /// Update admission limits without dropping active guards or sessions.
+     pub fn reload_client_limits(&self, clients: &[authentication::registry_based::Client]) {
+         if let Some(limiter) = &self.context.connection_limiter {
+@@ -822,6 +828,7 @@ impl Default for Context {
+             next_client_id: Default::default(),
+             next_tunnel_id: Default::default(),
+             connection_limiter: None,
++            traffic_control: Arc::default(),
+         }
+     }
+ }
+diff --git a/lib/src/datagram_pipe.rs b/lib/src/datagram_pipe.rs
+index cf332a1..c3d3a97 100644
+--- a/lib/src/datagram_pipe.rs
++++ b/lib/src/datagram_pipe.rs
+@@ -49,6 +49,7 @@ pub(crate) trait DuplexPipe: Send {
+ }
+ 
+ pub(crate) struct GenericSimplexPipe<D, F> {
++    control: Option<std::sync::Arc<crate::traffic_control::UserControl>>,
+     direction: pipe::SimplexDirection,
+     source: Box<dyn Source<Output = D>>,
+     sink: Box<dyn Sink<Input = D>>,
+@@ -66,6 +67,14 @@ where
+     D2: Datagram + Debug,
+     F: Fn(pipe::SimplexDirection, usize) + Send + Clone,
+ {
++    pub(crate) fn with_control(
++        mut self,
++        control: Option<std::sync::Arc<crate::traffic_control::UserControl>>,
++    ) -> Self {
++        self.left_pipe.control = control.clone();
++        self.right_pipe.control = control;
++        self
++    }
+     pub fn new(
+         (dir1, source1, sink1): (
+             pipe::SimplexDirection,
+@@ -114,6 +123,7 @@ impl<D: Datagram + Debug, F: Fn(pipe::SimplexDirection, usize) + Send> GenericSi
+     ) -> Self {
+         Self {
+             direction,
++            control: None,
+             source,
+             sink,
+             update_metrics,
+@@ -132,6 +142,9 @@ impl<D: Datagram + Debug, F: Fn(pipe::SimplexDirection, usize) + Send> GenericSi
+             );
+ 
+             let datagram_len = datagram.len();
++            if let Some(control) = &self.control {
++                control.acquire(self.direction, datagram_len).await?;
++            }
+             match self.sink.write(datagram).await? {
+                 SendStatus::Sent => {
+                     (self.update_metrics)(self.direction, datagram_len);
+diff --git a/lib/src/lib.rs b/lib/src/lib.rs
+index 0995e67..d37dc8b 100644
+--- a/lib/src/lib.rs
++++ b/lib/src/lib.rs
+@@ -13,6 +13,7 @@ pub mod net_utils;
+ pub mod rules;
+ pub mod settings;
+ pub mod shutdown;
++pub mod traffic_control;
+ pub mod utils;
+ 
+ mod connection_limiter;
+diff --git a/lib/src/pipe.rs b/lib/src/pipe.rs
+index 843803c..df89393 100644
+--- a/lib/src/pipe.rs
++++ b/lib/src/pipe.rs
+@@ -92,6 +92,7 @@ pub(crate) struct SimplexPipe<F> {
+     pending_chunk: Option<Data>,
+     direction: SimplexDirection,
+     last_activity: Instant,
++    control: Option<std::sync::Arc<crate::traffic_control::UserControl>>,
+ }
+ 
+ pub(crate) struct Error<T> {
+@@ -136,6 +137,7 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
+             pending_chunk: Default::default(),
+             direction,
+             last_activity: Instant::now(),
++            control: None,
+         }
+     }
+ 
+@@ -180,24 +182,37 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
+             match data {
+                 Data::Chunk(bytes) => {
+                     let data_len = bytes.len();
++                    let granted = if let Some(control) = &self.control {
++                        let n = data_len.min(16384);
++                        control
++                            .acquire(self.direction, n)
++                            .await
++                            .map_err(|e| io_to_pipe_error(id, e))?;
++                        n
++                    } else {
++                        data_len
++                    };
+                     let unsent_data = self
+                         .sink
+-                        .write(bytes)
++                        .write(bytes.slice(..granted))
+                         .map_err(|e| io_to_pipe_error(id, e))?;
+-                    let sent = data_len - unsent_data.len();
++                    let sent = granted - unsent_data.len();
++                    if let Some(control) = &self.control {
++                        control.refund(self.direction, granted - sent);
++                    }
+                     (self.update_metrics)(self.direction, sent);
+                     self.source
+                         .consume(sent)
+                         .map_err(|e| io_to_pipe_error(id, e))?;
+-                    if !unsent_data.is_empty() {
++                    if sent < data_len {
+                         log_dir!(
+                             trace,
+                             self.source.id(),
+                             self.direction,
+                             "Unsent: {} bytes",
+-                            unsent_data.len()
++                            data_len - sent
+                         );
+-                        self.pending_chunk = Some(Data::Chunk(unsent_data));
++                        self.pending_chunk = Some(Data::Chunk(bytes.slice(sent..)));
+                     }
+                 }
+                 Data::Eof => {
+@@ -220,6 +235,14 @@ pub(crate) struct DuplexPipe<F> {
+ }
+ 
+ impl<F: Fn(SimplexDirection, usize) + Send + Clone> DuplexPipe<F> {
++    pub(crate) fn with_control(
++        mut self,
++        control: Option<std::sync::Arc<crate::traffic_control::UserControl>>,
++    ) -> Self {
++        self.left_pipe.control = control.clone();
++        self.right_pipe.control = control;
++        self
++    }
+     pub fn new(
+         (dir1, source1, sink1): (SimplexDirection, Box<dyn Source>, Box<dyn Sink>),
+         (dir2, source2, sink2): (SimplexDirection, Box<dyn Source>, Box<dyn Sink>),
+@@ -293,3 +316,73 @@ impl<F: Fn(SimplexDirection, usize) + Send + Clone> DuplexPipe<F> {
+ fn io_to_pipe_error<T>(id: T, io: io::Error) -> Error<T> {
+     Error { id, io }
+ }
++
++#[cfg(test)]
++mod managed_tests {
++    use super::*;
++    use std::sync::{
++        atomic::{AtomicUsize, Ordering},
++        Arc,
++    };
++    struct OneChunk {
++        chunk: Option<Bytes>,
++        consumed: Arc<AtomicUsize>,
++    }
++    #[async_trait]
++    impl Source for OneChunk {
++        fn id(&self) -> log_utils::IdChain<u64> {
++            log_utils::IdChain::empty()
++        }
++        async fn read(&mut self) -> io::Result<Data> {
++            Ok(self.chunk.take().map_or(Data::Eof, Data::Chunk))
++        }
++        fn consume(&mut self, n: usize) -> io::Result<()> {
++            self.consumed.fetch_add(n, Ordering::Relaxed);
++            Ok(())
++        }
++    }
++    struct PartialSink;
++    #[async_trait]
++    impl Sink for PartialSink {
++        fn id(&self) -> log_utils::IdChain<u64> {
++            log_utils::IdChain::empty()
++        }
++        fn write(&mut self, data: Bytes) -> io::Result<Bytes> {
++            Ok(data.slice(data.len().min(1024)..))
++        }
++        fn eof(&mut self) -> io::Result<()> {
++            Ok(())
++        }
++        async fn wait_writable(&mut self) -> io::Result<()> {
++            tokio::task::yield_now().await;
++            Ok(())
++        }
++    }
++    #[tokio::test(start_paused = true)]
++    async fn partial_writes_are_not_charged_repeatedly() {
++        let control = Arc::new(crate::traffic_control::TrafficControl::default());
++        control.replace(&[crate::traffic_control::TrafficPolicy {
++            username: "alice".into(),
++            enabled: true,
++            download_mbps: 1,
++            upload_mbps: 1,
++        }]);
++        let session = control.session();
++        let user = session.bind("alice").unwrap().unwrap();
++        let consumed = Arc::new(AtomicUsize::new(0));
++        let mut pipe = SimplexPipe::new(
++            Box::new(OneChunk {
++                chunk: Some(Bytes::from(vec![1; 65536])),
++                consumed: consumed.clone(),
++            }),
++            Box::new(PartialSink),
++            |_, _| {},
++            SimplexDirection::Incoming,
++        );
++        pipe.control = Some(user);
++        let start = Instant::now();
++        assert!(pipe.exchange((), Duration::from_secs(30)).await.is_ok());
++        assert_eq!(consumed.load(Ordering::Relaxed), 65536);
++        assert_eq!(Instant::now(), start);
++    }
++}
+diff --git a/lib/src/traffic_control.rs b/lib/src/traffic_control.rs
+new file mode 100644
+index 0000000..3d254b9
+--- /dev/null
++++ b/lib/src/traffic_control.rs
+@@ -0,0 +1,338 @@
++//! Shared per-user pacing and cancellation for the managed endpoint.
++use crate::pipe::SimplexDirection;
++use serde::{Deserialize, Serialize};
++use std::collections::HashMap;
++use std::io;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::{Arc, Mutex, RwLock, Weak};
++use tokio::sync::watch;
++use tokio::time::{Duration, Instant};
++
++#[derive(Clone, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct TrafficPolicy {
++    pub username: String,
++    pub enabled: bool,
++    pub download_mbps: u32,
++    pub upload_mbps: u32,
++}
++
++struct Bucket {
++    rate: u64,
++    tokens: f64,
++    at: Instant,
++}
++impl Bucket {
++    fn capacity(rate: u64) -> f64 {
++        (rate / 10).max(65536) as f64
++    }
++    fn new(mbps: u32) -> Self {
++        let rate = u64::from(mbps) * 125000;
++        Self {
++            rate,
++            tokens: Self::capacity(rate),
++            at: Instant::now(),
++        }
++    }
++    fn refill(&mut self) {
++        let now = Instant::now();
++        self.tokens = (self.tokens + now.duration_since(self.at).as_secs_f64() * self.rate as f64)
++            .min(Self::capacity(self.rate));
++        self.at = now;
++    }
++    fn update(&mut self, mbps: u32) {
++        self.refill();
++        self.rate = u64::from(mbps) * 125000;
++        self.tokens = self.tokens.min(Self::capacity(self.rate));
++    }
++}
++
++pub(crate) struct UserControl {
++    enabled: AtomicBool,
++    download: Mutex<Bucket>,
++    upload: Mutex<Bucket>,
++    changed: watch::Sender<u64>,
++}
++impl UserControl {
++    pub(crate) fn refund(&self, direction: SimplexDirection, bytes: usize) {
++        let mut b = match direction {
++            SimplexDirection::Incoming => self.download.lock().unwrap(),
++            SimplexDirection::Outgoing => self.upload.lock().unwrap(),
++        };
++        b.refill();
++        b.tokens = (b.tokens + bytes as f64).min(Bucket::capacity(b.rate));
++    }
++    fn new(p: &TrafficPolicy) -> Self {
++        Self {
++            enabled: AtomicBool::new(p.enabled),
++            download: Mutex::new(Bucket::new(p.download_mbps)),
++            upload: Mutex::new(Bucket::new(p.upload_mbps)),
++            changed: watch::channel(0).0,
++        }
++    }
++    fn update(&self, p: &TrafficPolicy) {
++        self.download.lock().unwrap().update(p.download_mbps);
++        self.upload.lock().unwrap().update(p.upload_mbps);
++        self.enabled.store(p.enabled, Ordering::Release);
++        self.changed.send_modify(|n| *n = n.wrapping_add(1));
++    }
++    pub(crate) async fn acquire(
++        &self,
++        direction: SimplexDirection,
++        mut bytes: usize,
++    ) -> io::Result<()> {
++        let mut changed = self.changed.subscribe();
++        while bytes > 0 {
++            if !self.enabled.load(Ordering::Acquire) {
++                return Err(io::ErrorKind::PermissionDenied.into());
++            }
++            changed.borrow_and_update();
++            let delay = {
++                let mut b = match direction {
++                    SimplexDirection::Incoming => self.download.lock().unwrap(),
++                    SimplexDirection::Outgoing => self.upload.lock().unwrap(),
++                };
++                b.refill();
++                if b.rate == 0 {
++                    return Ok(());
++                }
++                let part = bytes.min(Bucket::capacity(b.rate) as usize);
++                if b.tokens >= part as f64 {
++                    b.tokens -= part as f64;
++                    bytes -= part;
++                    None
++                } else {
++                    Some(Duration::from_secs_f64(
++                        ((part as f64 - b.tokens) / b.rate as f64).max(0.000001),
++                    ))
++                }
++            };
++            if let Some(delay) = delay {
++                tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = changed.changed() => {} }
++            }
++        }
++        Ok(())
++    }
++}
++
++#[derive(Default)]
++pub struct TrafficControl {
++    policies: RwLock<Option<HashMap<String, Arc<UserControl>>>>,
++    sessions: Mutex<HashMap<u64, Weak<ManagedSession>>>,
++    next: AtomicU64,
++}
++pub(crate) struct ManagedSession {
++    id: u64,
++    owner: Mutex<Option<String>>,
++    cancel: watch::Sender<bool>,
++    control: Weak<TrafficControl>,
++}
++impl Drop for ManagedSession {
++    fn drop(&mut self) {
++        if let Some(c) = self.control.upgrade() {
++            c.sessions.lock().unwrap().remove(&self.id);
++        }
++    }
++}
++impl ManagedSession {
++    pub(crate) fn close(&self) {
++        self.cancel.send_replace(true);
++    }
++    pub(crate) async fn cancelled(&self) {
++        let mut rx = self.cancel.subscribe();
++        while !*rx.borrow_and_update() {
++            if rx.changed().await.is_err() {
++                break;
++            }
++        }
++    }
++    pub(crate) fn bind(&self, username: &str) -> io::Result<Option<Arc<UserControl>>> {
++        let control = self
++            .control
++            .upgrade()
++            .ok_or(io::ErrorKind::ConnectionAborted)?;
++        let policies = control.policies.read().unwrap();
++        let Some(policies) = policies.as_ref() else {
++            return Ok(None);
++        };
++        let user = policies
++            .get(username)
++            .filter(|u| u.enabled.load(Ordering::Acquire))
++            .cloned()
++            .ok_or(io::ErrorKind::PermissionDenied)?;
++        let mut owner = self.owner.lock().unwrap();
++        if *self.cancel.borrow() || owner.as_ref().is_some_and(|u| u != username) {
++            return Err(io::ErrorKind::PermissionDenied.into());
++        }
++        *owner = Some(username.into());
++        Ok(Some(user))
++    }
++}
++impl TrafficControl {
++    pub fn replace(&self, replacement: &[TrafficPolicy]) {
++        let mut policies = self.policies.write().unwrap();
++        let old = policies.get_or_insert_with(HashMap::new);
++        let mut next = HashMap::new();
++        for p in replacement {
++            let user = old
++                .get(&p.username)
++                .cloned()
++                .unwrap_or_else(|| Arc::new(UserControl::new(p)));
++            user.update(p);
++            next.insert(p.username.clone(), user);
++        }
++        for (name, user) in old.iter() {
++            if !next.contains_key(name) {
++                user.enabled.store(false, Ordering::Release);
++                user.changed.send_modify(|n| *n = n.wrapping_add(1));
++            }
++        }
++        *old = next;
++        // Keep the policy lock until affected transports are marked. New binds cannot race removal.
++        let sessions: Vec<_> = self
++            .sessions
++            .lock()
++            .unwrap()
++            .values()
++            .filter_map(Weak::upgrade)
++            .collect();
++        for session in sessions {
++            if let Some(name) = session.owner.lock().unwrap().as_ref() {
++                if !old
++                    .get(name)
++                    .is_some_and(|u| u.enabled.load(Ordering::Acquire))
++                {
++                    session.cancel.send_replace(true);
++                }
++            }
++        }
++    }
++    pub fn disconnect(&self, username: &str) -> usize {
++        let sessions: Vec<_> = self
++            .sessions
++            .lock()
++            .unwrap()
++            .values()
++            .filter_map(Weak::upgrade)
++            .collect();
++        let mut count = 0;
++        for session in sessions {
++            if session.owner.lock().unwrap().as_deref() == Some(username)
++                && !*session.cancel.borrow()
++            {
++                session.cancel.send_replace(true);
++                count += 1;
++            }
++        }
++        count
++    }
++    pub(crate) fn session(self: &Arc<Self>) -> Arc<ManagedSession> {
++        let id = self.next.fetch_add(1, Ordering::Relaxed);
++        let session = Arc::new(ManagedSession {
++            id,
++            owner: Mutex::new(None),
++            cancel: watch::channel(false).0,
++            control: Arc::downgrade(self),
++        });
++        self.sessions
++            .lock()
++            .unwrap()
++            .insert(id, Arc::downgrade(&session));
++        session
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn policy(name: &str) -> TrafficPolicy {
++        TrafficPolicy {
++            username: name.into(),
++            enabled: true,
++            download_mbps: 1,
++            upload_mbps: 1,
++        }
++    }
++    #[tokio::test(start_paused = true)]
++    async fn parallel_streams_share_bucket_and_directions_are_independent() {
++        let c = Arc::new(TrafficControl::default());
++        c.replace(&[policy("alice"), policy("bob")]);
++        let a = c.session();
++        let user = a.bind("alice").unwrap().unwrap();
++        user.acquire(SimplexDirection::Incoming, 65536)
++            .await
++            .unwrap();
++        let started = Instant::now();
++        let (x, y) = tokio::join!(
++            user.acquire(SimplexDirection::Incoming, 62500),
++            user.acquire(SimplexDirection::Incoming, 62500)
++        );
++        x.unwrap();
++        y.unwrap();
++        assert!(Instant::now().duration_since(started) >= Duration::from_secs(1));
++        let started = Instant::now();
++        user.acquire(SimplexDirection::Outgoing, 65536)
++            .await
++            .unwrap();
++        assert_eq!(Instant::now(), started);
++        let b = c.session();
++        b.bind("bob")
++            .unwrap()
++            .unwrap()
++            .acquire(SimplexDirection::Incoming, 65536)
++            .await
++            .unwrap();
++        assert_eq!(Instant::now(), started);
++    }
++    #[tokio::test(start_paused = true)]
++    async fn changes_wake_waiters_and_do_not_reset_burst() {
++        let c = Arc::new(TrafficControl::default());
++        c.replace(&[policy("alice")]);
++        let session = c.session();
++        let user = session.bind("alice").unwrap().unwrap();
++        user.acquire(SimplexDirection::Incoming, 65536)
++            .await
++            .unwrap();
++        c.replace(&[policy("alice")]);
++        let start = Instant::now();
++        user.acquire(SimplexDirection::Incoming, 12500)
++            .await
++            .unwrap();
++        assert!(Instant::now().duration_since(start) >= Duration::from_millis(100));
++        let mut p = policy("alice");
++        p.download_mbps = 0;
++        let wait = user.acquire(SimplexDirection::Incoming, 1250000);
++        let update = async {
++            tokio::time::sleep(Duration::from_millis(10)).await;
++            c.replace(&[p]);
++        };
++        let start = Instant::now();
++        let (r, _) = tokio::join!(wait, update);
++        r.unwrap();
++        assert_eq!(
++            Instant::now().duration_since(start),
++            Duration::from_millis(10)
++        );
++    }
++    #[tokio::test]
++    async fn kick_is_targeted_and_cancellation_cannot_be_missed() {
++        let c = Arc::new(TrafficControl::default());
++        c.replace(&[policy("alice"), policy("bob")]);
++        let a = c.session();
++        a.bind("alice").unwrap();
++        let b = c.session();
++        b.bind("bob").unwrap();
++        assert!(a.bind("bob").is_err());
++        assert_eq!(c.disconnect("alice"), 1);
++        assert_eq!(c.disconnect("alice"), 0);
++        tokio::time::timeout(Duration::from_millis(100), a.cancelled())
++            .await
++            .unwrap();
++        assert!(!*b.cancel.borrow());
++        let new = c.session();
++        assert!(new.bind("alice").is_ok());
++        c.replace(&[policy("bob")]);
++        assert!(*new.cancel.borrow());
++        assert!(!*b.cancel.borrow());
++    }
++}
+diff --git a/lib/src/tunnel.rs b/lib/src/tunnel.rs
+index 06242b1..213db12 100644
+--- a/lib/src/tunnel.rs
++++ b/lib/src/tunnel.rs
+@@ -43,6 +43,7 @@ pub(crate) struct Tunnel {
+     /// Set at construction time for SNI-authenticated connections,
+     /// or lazily on the first authenticated request for proxy-basic connections.
+     connection_guard: Option<ConnectionGuard>,
++    managed_session: Arc<crate::traffic_control::ManagedSession>,
+     id: log_utils::IdChain<u64>,
+ }
+ 
+@@ -81,6 +82,7 @@ impl Tunnel {
+         id: log_utils::IdChain<u64>,
+     ) -> Self {
+         Self {
++            managed_session: context.traffic_control.session(),
+             context,
+             downstream,
+             forwarder: Arc::new(Mutex::new(forwarder)),
+@@ -91,11 +93,26 @@ impl Tunnel {
+     }
+ 
+     pub async fn listen(&mut self) -> io::Result<()> {
++        let session = self.managed_session.clone();
++        if let AuthenticationPolicy::Authenticated(source) = &self.authentication_policy {
++            if let Some(username) = self
++                .context
++                .authenticator
++                .as_ref()
++                .and_then(|a| a.username(source))
++            {
++                session.bind(&username)?;
++            }
++        }
+         let (mut shutdown_notification, _shutdown_completion) = {
+             let shutdown = self.context.shutdown.lock().unwrap();
+             (shutdown.notification_handler(), shutdown.completion_guard())
+         };
+-        tokio::select! {
++        let result = tokio::select! {
++            _ = session.cancelled() => {
++                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.downstream.graceful_shutdown()).await;
++                Ok(())
++            }
+             x = shutdown_notification.wait() => {
+                 match x {
+                     Ok(_) => self.downstream.graceful_shutdown().await,
+@@ -103,7 +120,9 @@ impl Tunnel {
+                 }
+             }
+             x = self.listen_inner() => x,
+-        }
++        };
++        session.close();
++        result
+     }
+ 
+     fn resolve_username(
+@@ -161,6 +180,7 @@ impl Tunnel {
+             let authentication_policy = self.authentication_policy.clone();
+             let log_id = self.id.clone();
+             let protocol = self.downstream.protocol();
++            let managed_session = self.managed_session.clone();
+             let username = if context.metrics.per_client() {
+                 self.resolve_username(request.as_ref())
+             } else {
+@@ -296,6 +316,24 @@ impl Tunnel {
+                     "Authentication complete, promoting request"
+                 );
+ 
++                let control = match forwarder_auth.as_ref().and_then(|source| {
++                    context
++                        .authenticator
++                        .as_ref()
++                        .and_then(|a| a.username(source))
++                }) {
++                    Some(username) => match managed_session.bind(&username) {
++                        Ok(control) => control,
++                        Err(_) => {
++                            request.fail_request(ConnectionError::Authentication(
++                                "Managed access denied".into(),
++                            ));
++                            return;
++                        }
++                    },
++                    None => None,
++                };
++
+                 // If this request carried credentials, relabel the session
+                 // with the authenticated username (no-op if it's already labelled).
+                 if let Ok(Some(source)) = auth_info_result {
+@@ -311,52 +349,57 @@ impl Tunnel {
+                         );
+                     }
+                 }
+-                match request.promote_to_next_state() {
+-                    Ok(None) => {
+-                        log_id!(trace, request_id, "Health check request completed");
+-                    }
+-                    Ok(Some(PendingDemultiplexedRequest::TcpConnect(request))) => {
+-                        log_id!(trace, request_id, "Handling TCP connect request");
+-                        if let Err((request, message, e)) = Tunnel::on_tcp_connect_request(
+-                            context.clone(),
+-                            forwarder,
+-                            request,
+-                            forwarder_auth,
+-                            tls_domain,
+-                            update_metrics,
+-                        )
+-                        .await
+-                        {
+-                            report_fatal_if_too_many_open_files(&context, &e);
+-                            log_id!(debug, request_id, "{}: {}", message, e);
+-                            if let Some(request) = request {
+-                                request.fail_request(e);
++                let work = async {
++                    match request.promote_to_next_state() {
++                        Ok(None) => {
++                            log_id!(trace, request_id, "Health check request completed");
++                        }
++                        Ok(Some(PendingDemultiplexedRequest::TcpConnect(request))) => {
++                            log_id!(trace, request_id, "Handling TCP connect request");
++                            if let Err((request, message, e)) = Tunnel::on_tcp_connect_request(
++                                context.clone(),
++                                forwarder,
++                                request,
++                                forwarder_auth,
++                                tls_domain,
++                                update_metrics,
++                                control,
++                            )
++                            .await
++                            {
++                                report_fatal_if_too_many_open_files(&context, &e);
++                                log_id!(debug, request_id, "{}: {}", message, e);
++                                if let Some(request) = request {
++                                    request.fail_request(e);
++                                }
+                             }
+                         }
+-                    }
+-                    Ok(Some(PendingDemultiplexedRequest::DatagramMultiplexer(request))) => {
+-                        log_id!(trace, request_id, "Handling datagram multiplexer request");
+-                        if let Err((request, message, e)) = Tunnel::on_datagram_mux_request(
+-                            context.clone(),
+-                            forwarder,
+-                            request,
+-                            forwarder_auth,
+-                            tls_domain,
+-                            update_metrics,
+-                        )
+-                        .await
+-                        {
+-                            report_fatal_if_too_many_open_files(&context, &e);
+-                            log_id!(debug, request_id, "{}: {}", message, e);
+-                            if let Some(request) = request {
+-                                request.fail_request(e);
++                        Ok(Some(PendingDemultiplexedRequest::DatagramMultiplexer(request))) => {
++                            log_id!(trace, request_id, "Handling datagram multiplexer request");
++                            if let Err((request, message, e)) = Tunnel::on_datagram_mux_request(
++                                context.clone(),
++                                forwarder,
++                                request,
++                                forwarder_auth,
++                                tls_domain,
++                                update_metrics,
++                                control,
++                            )
++                            .await
++                            {
++                                report_fatal_if_too_many_open_files(&context, &e);
++                                log_id!(debug, request_id, "{}: {}", message, e);
++                                if let Some(request) = request {
++                                    request.fail_request(e);
++                                }
+                             }
+                         }
++                        Err(e) => {
++                            log_id!(debug, request_id, "Failed to complete request: {}", e);
++                        }
+                     }
+-                    Err(e) => {
+-                        log_id!(debug, request_id, "Failed to complete request: {}", e);
+-                    }
+-                }
++                };
++                tokio::select! { biased; _ = managed_session.cancelled() => {}, _ = work => {} }
+             });
+         }
+     }
+@@ -368,6 +411,7 @@ impl Tunnel {
+         forwarder_auth: Option<authentication::Source<'static>>,
+         tls_domain: String,
+         update_metrics: F,
++        control: Option<Arc<crate::traffic_control::UserControl>>,
+     ) -> Result<
+         (),
+         (
+@@ -451,7 +495,8 @@ impl Tunnel {
+             (pipe::SimplexDirection::Outgoing, dstr_rx, fwd_tx),
+             (pipe::SimplexDirection::Incoming, fwd_rx, dstr_tx),
+             update_metrics,
+-        );
++        )
++        .with_control(control);
+ 
+         log_id!(trace, request_id, "TCP connect: pipe exchange started");
+         match pipe
+@@ -476,6 +521,7 @@ impl Tunnel {
+         forwarder_auth: Option<authentication::Source<'static>>,
+         tls_domain: String,
+         update_metrics: F,
++        control: Option<Arc<crate::traffic_control::UserControl>>,
+     ) -> Result<
+         (),
+         (
+@@ -535,12 +581,15 @@ impl Tunnel {
+                     }
+                 };
+ 
+-                Box::new(udp_pipe::DuplexPipe::new(
+-                    (dstr_source, dstr_sink),
+-                    (fwd_shared, fwd_source, fwd_sink),
+-                    update_metrics,
+-                    context.settings.udp_connections_timeout,
+-                ))
++                Box::new(
++                    udp_pipe::DuplexPipe::new(
++                        (dstr_source, dstr_sink),
++                        (fwd_shared, fwd_source, fwd_sink),
++                        update_metrics,
++                        context.settings.udp_connections_timeout,
++                    )
++                    .with_control(control),
++                )
+             }
+             Ok(downstream::DatagramPipeHalves::Icmp(dstr_source, dstr_sink)) => {
+                 let (fwd_source, fwd_sink) = match forwarder
+@@ -565,11 +614,14 @@ impl Tunnel {
+                     }
+                 };
+ 
+-                Box::new(datagram_pipe::GenericDuplexPipe::new(
+-                    (pipe::SimplexDirection::Outgoing, dstr_source, fwd_sink),
+-                    (pipe::SimplexDirection::Incoming, fwd_source, dstr_sink),
+-                    update_metrics,
+-                ))
++                Box::new(
++                    datagram_pipe::GenericDuplexPipe::new(
++                        (pipe::SimplexDirection::Outgoing, dstr_source, fwd_sink),
++                        (pipe::SimplexDirection::Incoming, fwd_source, dstr_sink),
++                        update_metrics,
++                    )
++                    .with_control(control),
++                )
+             }
+             Err(e) => {
+                 return Err((
+diff --git a/lib/src/udp_pipe.rs b/lib/src/udp_pipe.rs
+index 05f143f..91277e0 100644
+--- a/lib/src/udp_pipe.rs
++++ b/lib/src/udp_pipe.rs
+@@ -16,6 +16,7 @@ pub(crate) struct DuplexPipe<F: Send + Sync> {
+ 
+ /// Forwards UDP packets from a client to a target host
+ struct LeftPipe<F: Send + Sync> {
++    control: Option<Arc<crate::traffic_control::UserControl>>,
+     source: Box<dyn datagram_pipe::Source<Output = downstream::UdpDatagram>>,
+     sink: Box<dyn datagram_pipe::Sink<Input = downstream::UdpDatagram>>,
+     shared: Arc<UdpPipeShared<F>>,
+@@ -25,6 +26,7 @@ struct LeftPipe<F: Send + Sync> {
+ 
+ /// Forwards UDP packets from a target host to a client
+ struct RightPipe<F: Send + Sync> {
++    control: Option<Arc<crate::traffic_control::UserControl>>,
+     source: Box<dyn datagram_pipe::Source<Output = forwarder::UdpDatagramReadStatus>>,
+     sink: Box<dyn datagram_pipe::Sink<Input = forwarder::UdpDatagram>>,
+     shared: Arc<UdpPipeShared<F>>,
+@@ -71,6 +73,9 @@ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> LeftPipe<F> {
+             }
+ 
+             let datagram_len = datagram.payload.len();
++            if let Some(control) = &self.control {
++                control.acquire(self.direction, datagram_len).await?;
++            }
+             match self.sink.write(datagram).await? {
+                 datagram_pipe::SendStatus::Sent => {
+                     (self.shared.update_metrics)(self.direction, datagram_len);
+@@ -147,6 +152,9 @@ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> RightPipe<F> {
+ 
+             let meta = datagram.meta;
+             let datagram_len = datagram.payload.len();
++            if let Some(control) = &self.control {
++                control.acquire(self.direction, datagram_len).await?;
++            }
+             match self.sink.write(datagram).await? {
+                 datagram_pipe::SendStatus::Sent => {
+                     (self.shared.update_metrics)(self.direction, datagram_len);
+@@ -208,6 +216,14 @@ impl UdpConnection {
+ }
+ 
+ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> DuplexPipe<F> {
++    pub(crate) fn with_control(
++        mut self,
++        control: Option<Arc<crate::traffic_control::UserControl>>,
++    ) -> Self {
++        self.left_pipe.control = control.clone();
++        self.right_pipe.control = control;
++        self
++    }
+     #[allow(clippy::type_complexity)]
+     pub fn new(
+         (source1, sink1): (
+@@ -230,6 +246,7 @@ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> DuplexPipe<F> {
+ 
+         Self {
+             left_pipe: LeftPipe {
++                control: None,
+                 source: source1,
+                 sink: sink2,
+                 shared: shared.clone(),
+@@ -237,6 +254,7 @@ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> DuplexPipe<F> {
+                 next_connection_id: 0..,
+             },
+             right_pipe: RightPipe {
++                control: None,
+                 source: source2,
+                 sink: sink1,
+                 shared,
+diff --git a/lib/tests/common/mod.rs b/lib/tests/common/mod.rs
+index a851187..78a5f8a 100644
+--- a/lib/tests/common/mod.rs
++++ b/lib/tests/common/mod.rs
+@@ -303,6 +303,17 @@ pub struct Http3Session {
+ }
+ 
+ impl Http3Session {
++    pub async fn wait_for_peer_close(&mut self) {
++        loop {
++            Self::read_out_socket(&self.socket, &mut self.quic_conn);
++            if self.quic_conn.is_closed() || self.quic_conn.peer_error().is_some() {
++                return;
++            }
++            Self::flush_quic_data(&self.socket, &mut self.quic_conn);
++            // Do not manufacture a timeout-based close: this test requires the peer's close packet.
++            let _ = tokio::time::timeout(Duration::from_millis(100), self.socket.readable()).await;
++        }
++    }
+     pub async fn connect(peer: &SocketAddr, server_name: &str, alpn: Option<&[u8]>) -> Self {
+         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+ 
+@@ -466,7 +477,10 @@ impl Http3Session {
+         self.recv_response_with_method(&http::Method::GET).await
+     }
+ 
+-    async fn recv_response_with_method(&mut self, method: &http::Method) -> http::response::Parts {
++    pub async fn recv_response_with_method(
++        &mut self,
++        method: &http::Method,
++    ) -> http::response::Parts {
+         Self::read_out_socket(&self.socket, &mut self.quic_conn);
+         Self::flush_quic_data(&self.socket, &mut self.quic_conn);
+ 
+diff --git a/lib/tests/managed.rs b/lib/tests/managed.rs
+new file mode 100644
+index 0000000..b354f00
+--- /dev/null
++++ b/lib/tests/managed.rs
+@@ -0,0 +1,348 @@
++//! Actual TLS H2 and QUIC H3 traffic, not a standalone token-bucket simulation.
++use base64::{engine::general_purpose::STANDARD, Engine};
++use http::Request;
++use std::net::{Ipv4Addr, SocketAddr};
++use std::sync::Arc;
++use std::time::Duration;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::TcpListener;
++use trusttunnel::authentication::registry_based::{Client, RegistryBasedAuthenticator};
++use trusttunnel::core::Core;
++use trusttunnel::settings::{
++    Http2Settings, ListenProtocolSettings, QuicSettings, Settings, TlsHostInfo, TlsHostsSettings,
++};
++use trusttunnel::shutdown::Shutdown;
++use trusttunnel::traffic_control::TrafficPolicy;
++#[allow(dead_code)]
++mod common;
++
++async fn transfer(
++    h3: bool,
++    endpoint: SocketAddr,
++    target: SocketAddr,
++    username: &str,
++    upload: bool,
++) -> usize {
++    let auth = format!(
++        "Basic {}",
++        STANDARD.encode(format!("{}:test-password-123", username))
++    );
++    let req = Request::builder()
++        .method("CONNECT")
++        .uri(target.to_string())
++        .header("proxy-authorization", auth)
++        .body(hyper::Body::empty())
++        .unwrap();
++    if h3 {
++        let mut client = common::Http3Session::connect(&endpoint, "localhost", None).await;
++        client.send_request(req).await;
++        assert_eq!(
++            client
++                .recv_response_with_method(&http::Method::CONNECT)
++                .await
++                .status,
++            http::StatusCode::OK
++        );
++        if upload {
++            client
++                .send(common::make_stream_of_chunks(262144, None))
++                .await;
++            let mut ack = [0u8; 1];
++            assert_eq!(client.recv(&mut ack).await, 1);
++            assert_eq!(ack[0], 7);
++            return 262144;
++        }
++        let mut total = 0;
++        let mut buf = vec![0; 16384];
++        while total < 262144 {
++            let n = client.recv(&mut buf).await;
++            if n == 0 {
++                break;
++            };
++            total += n;
++        }
++        total
++    } else {
++        let tls = common::establish_tls_connection("localhost", &endpoint, Some(b"h2")).await;
++        let (mut client, connection) = hyper::client::conn::Builder::new()
++            .http2_only(true)
++            .handshake(tls)
++            .await
++            .unwrap();
++        let driver = tokio::spawn(async move {
++            let _ = connection.await;
++        });
++        let resp = client.send_request(req).await.unwrap();
++        assert_eq!(resp.status(), http::StatusCode::OK);
++        let mut io = hyper::upgrade::on(resp).await.unwrap();
++        if upload {
++            io.write_all(&vec![42u8; 262144]).await.unwrap();
++            let mut ack = [0u8; 1];
++            io.read_exact(&mut ack).await.unwrap();
++            assert_eq!(ack[0], 7);
++            driver.abort();
++            return 262144;
++        }
++        let mut buf = Vec::new();
++        while buf.len() < 262144 {
++            let mut chunk = vec![0; 16384];
++            let n = io.read(&mut chunk).await.unwrap();
++            if n == 0 {
++                break;
++            };
++            buf.extend_from_slice(&chunk[..n]);
++        }
++        driver.abort();
++        buf.len()
++    }
++}
++
++fn make_endpoint() -> (SocketAddr, common::File, Arc<Core>) {
++    let endpoint = common::make_endpoint_address();
++    let cert = common::make_cert_key_file();
++    let cert_path = cert.path.to_str().unwrap().to_string();
++    let settings = Settings::builder()
++        .listen_address(&endpoint)
++        .unwrap()
++        .allow_private_network_connections(true)
++        .listen_protocols(ListenProtocolSettings {
++            http1: None,
++            http2: Some(Http2Settings::builder().build()),
++            quic: Some(QuicSettings::builder().build()),
++        })
++        .clients(
++            ["alice", "bob"]
++                .iter()
++                .map(|name| Client {
++                    username: (*name).into(),
++                    password: "test-password-123".into(),
++                    max_http2_conns: None,
++                    max_http3_conns: None,
++                })
++                .collect(),
++        )
++        .build()
++        .unwrap();
++    let registry = Arc::new(RegistryBasedAuthenticator::new(settings.get_clients()));
++    let hosts = TlsHostsSettings::builder()
++        .main_hosts(vec![TlsHostInfo {
++            hostname: "localhost".into(),
++            cert_chain_path: cert_path.clone(),
++            private_key_path: cert_path,
++            allowed_sni: vec![],
++        }])
++        .build()
++        .unwrap();
++    let core = Arc::new(Core::new(settings, Some(registry), hosts, Shutdown::new()).unwrap());
++    core.traffic_control().replace(&[
++        TrafficPolicy {
++            username: "alice".into(),
++            enabled: true,
++            download_mbps: 2,
++            upload_mbps: 2,
++        },
++        TrafficPolicy {
++            username: "bob".into(),
++            enabled: true,
++            download_mbps: 0,
++            upload_mbps: 0,
++        },
++    ]);
++    (endpoint, cert, core)
++}
++
++async fn shared_rate_over_transport(h3: bool, upload: bool) {
++    let (endpoint, cert, core) = make_endpoint();
++    let server = tokio::spawn({
++        let core = core.clone();
++        async move { core.listen().await.unwrap() }
++    });
++    let origin = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
++    let target = origin.local_addr().unwrap();
++    let origin_task = tokio::spawn(async move {
++        loop {
++            let (mut socket, _) = origin.accept().await.unwrap();
++            tokio::spawn(async move {
++                if upload {
++                    let mut bytes = vec![0u8; 262144];
++                    socket.read_exact(&mut bytes).await.unwrap();
++                    socket.write_all(&[7]).await.unwrap();
++                } else {
++                    let _ = socket.write_all(&vec![42u8; 262144]).await;
++                }
++            });
++        }
++    });
++    tokio::time::sleep(Duration::from_millis(200)).await;
++    let start = tokio::time::Instant::now();
++    let work = async {
++        let alice = async {
++            let (a, b) = tokio::join!(
++                Box::pin(transfer(h3, endpoint, target, "alice", upload)),
++                Box::pin(transfer(h3, endpoint, target, "alice", upload))
++            );
++            assert_eq!((a, b), (262144, 262144));
++            start.elapsed()
++        };
++        let bob = async {
++            assert_eq!(
++                Box::pin(transfer(h3, endpoint, target, "bob", upload)).await,
++                262144
++            );
++            start.elapsed()
++        };
++        let (alice, bob) = tokio::join!(alice, bob);
++        assert!(
++            alice >= Duration::from_millis(1600),
++            "parallel connections multiplied the rate: {:?}",
++            alice
++        );
++        assert!(
++            bob < alice,
++            "unrelated user was throttled: bob={:?}, alice={:?}",
++            bob,
++            alice
++        );
++    };
++    tokio::time::timeout(Duration::from_secs(20), work)
++        .await
++        .unwrap();
++    server.abort();
++    origin_task.abort();
++    drop(cert);
++}
++#[tokio::test]
++async fn h2_parallel_connections_share_download_limit() {
++    Box::pin(shared_rate_over_transport(false, false)).await;
++}
++#[tokio::test]
++async fn h3_parallel_connections_share_download_limit() {
++    Box::pin(shared_rate_over_transport(true, false)).await;
++}
++#[tokio::test]
++async fn h2_parallel_connections_share_upload_limit() {
++    Box::pin(shared_rate_over_transport(false, true)).await;
++}
++#[tokio::test]
++async fn h3_parallel_connections_share_upload_limit() {
++    Box::pin(shared_rate_over_transport(true, true)).await;
++}
++
++fn connect_request(target: SocketAddr, username: &str) -> Request<hyper::Body> {
++    Request::builder()
++        .method("CONNECT")
++        .uri(target.to_string())
++        .header(
++            "proxy-authorization",
++            format!(
++                "Basic {}",
++                STANDARD.encode(format!("{}:test-password-123", username))
++            ),
++        )
++        .body(hyper::Body::empty())
++        .unwrap()
++}
++async fn h2_echo(
++    endpoint: SocketAddr,
++    target: SocketAddr,
++    name: &str,
++) -> (
++    hyper::client::conn::SendRequest<hyper::Body>,
++    hyper::upgrade::Upgraded,
++    tokio::task::JoinHandle<()>,
++) {
++    let tls = common::establish_tls_connection("localhost", &endpoint, Some(b"h2")).await;
++    let (mut client, connection) = hyper::client::conn::Builder::new()
++        .http2_only(true)
++        .handshake(tls)
++        .await
++        .unwrap();
++    let driver = tokio::spawn(async move {
++        let _ = connection.await;
++    });
++    let resp = client
++        .send_request(connect_request(target, name))
++        .await
++        .unwrap();
++    assert_eq!(resp.status(), http::StatusCode::OK);
++    (client, hyper::upgrade::on(resp).await.unwrap(), driver)
++}
++async fn targeted_kick(h3: bool) {
++    let (endpoint, cert, core) = make_endpoint();
++    let server = tokio::spawn({
++        let core = core.clone();
++        async move { core.listen().await.unwrap() }
++    });
++    let origin = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
++    let target = origin.local_addr().unwrap();
++    let origin_task = tokio::spawn(async move {
++        loop {
++            let (mut io, _) = origin.accept().await.unwrap();
++            tokio::spawn(async move {
++                let (mut reader, mut writer) = io.split();
++                let _ = tokio::io::copy(&mut reader, &mut writer).await;
++            });
++        }
++    });
++    tokio::time::sleep(Duration::from_millis(200)).await;
++    let work = async {
++        if h3 {
++            let mut alice = common::Http3Session::connect(&endpoint, "localhost", None).await;
++            alice.send_request(connect_request(target, "alice")).await;
++            assert_eq!(
++                alice
++                    .recv_response_with_method(&http::Method::CONNECT)
++                    .await
++                    .status,
++                http::StatusCode::OK
++            );
++            let mut bob = common::Http3Session::connect(&endpoint, "localhost", None).await;
++            bob.send_request(connect_request(target, "bob")).await;
++            assert_eq!(
++                bob.recv_response_with_method(&http::Method::CONNECT)
++                    .await
++                    .status,
++                http::StatusCode::OK
++            );
++            assert_eq!(core.traffic_control().disconnect("alice"), 1);
++            tokio::time::timeout(Duration::from_secs(3), alice.wait_for_peer_close())
++                .await
++                .unwrap();
++            bob.send(futures::stream::iter([b"ok".as_slice()])).await;
++            let mut ack = [0u8; 2];
++            assert_eq!(bob.recv(&mut ack).await, 2);
++            assert_eq!(&ack, b"ok");
++        } else {
++            let (_alice_client, mut alice, mut driver) = h2_echo(endpoint, target, "alice").await;
++            let (_bob_client, mut bob, bob_driver) = h2_echo(endpoint, target, "bob").await;
++            assert_eq!(core.traffic_control().disconnect("alice"), 1);
++            let mut ack = [0u8; 2];
++            let closed = tokio::time::timeout(Duration::from_secs(3), alice.read(&mut ack))
++                .await
++                .unwrap();
++            assert!(closed.is_err() || closed.unwrap() == 0);
++            tokio::time::timeout(Duration::from_secs(3), &mut driver)
++                .await
++                .unwrap()
++                .unwrap();
++            bob.write_all(b"ok").await.unwrap();
++            bob.read_exact(&mut ack).await.unwrap();
++            assert_eq!(&ack, b"ok");
++            bob_driver.abort();
++        }
++    };
++    tokio::time::timeout(Duration::from_secs(10), Box::pin(work))
++        .await
++        .unwrap();
++    server.abort();
++    origin_task.abort();
++    drop(cert);
++}
++#[tokio::test]
++async fn h2_kick_closes_only_the_target_transport() {
++    Box::pin(targeted_kick(false)).await;
++}
++#[tokio::test]
++async fn h3_kick_closes_only_the_target_transport() {
++    Box::pin(targeted_kick(true)).await;
++}

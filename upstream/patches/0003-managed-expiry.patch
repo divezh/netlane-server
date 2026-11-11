@@ -1,0 +1,581 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8b29988..3f24bfb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+ 
+ ## [Unreleased]
+ 
++- [Feature] Managed `expires_at` closes expired VPN sessions and denies reconnects
++  independently of the admin panel; saved policies preserve expiry across restarts.
++
+ ### Added
+ 
+ ### Changed
+diff --git a/Cargo.lock b/Cargo.lock
+index a35cb1f..9ae38ca 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3568,6 +3568,7 @@ dependencies = [
+ name = "trusttunnel_endpoint"
+ version = "0.0.0"
+ dependencies = [
++ "chrono",
+  "clap",
+  "console-subscriber",
+  "hex",
+diff --git a/endpoint/Cargo.toml b/endpoint/Cargo.toml
+index 83dd5b1..2e4a7cb 100644
+--- a/endpoint/Cargo.toml
++++ b/endpoint/Cargo.toml
+@@ -8,6 +8,7 @@ name = "trusttunnel_endpoint"
+ doctest = false
+ 
+ [dependencies]
++chrono = { version = "0.4.26", default-features = false, features = ["clock"] }
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ tempfile = "3"
+diff --git a/endpoint/src/main.rs b/endpoint/src/main.rs
+index 3da32fb..c5ce269 100644
+--- a/endpoint/src/main.rs
++++ b/endpoint/src/main.rs
+@@ -15,7 +15,7 @@ use trusttunnel::shutdown::Shutdown;
+ use trusttunnel::{log_utils, settings};
+ mod management;
+ 
+-const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.2");
++const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.3");
+ const VERSION_PARAM_NAME: &str = "v_e_r_s_i_o_n_do_not_change_this_name_it_will_break";
+ const LOG_LEVEL_PARAM_NAME: &str = "log_level";
+ const LOG_FILE_PARAM_NAME: &str = "log_file";
+diff --git a/endpoint/src/management.rs b/endpoint/src/management.rs
+index 9374eb5..7226e95 100644
+--- a/endpoint/src/management.rs
++++ b/endpoint/src/management.rs
+@@ -22,6 +22,8 @@ pub struct ManagedUser {
+     pub enabled: bool,
+     pub download_mbps: u32,
+     pub upload_mbps: u32,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub expires_at: Option<String>,
+     pub revision: u64,
+     #[serde(default)]
+     pub max_http2_conns: Option<u32>,
+@@ -56,6 +58,15 @@ pub struct Management {
+ fn invalid() -> io::Error {
+     io::Error::new(io::ErrorKind::InvalidData, "invalid managed state")
+ }
++fn expiry_millis(value: Option<&str>) -> io::Result<Option<i64>> {
++    value
++        .map(|v| {
++            chrono::DateTime::parse_from_rfc3339(v)
++                .map(|t| t.timestamp_millis())
++                .map_err(|_| invalid())
++        })
++        .transpose()
++}
+ fn secure_parent(path: &Path) -> io::Result<()> {
+     let parent = std::fs::metadata(path.parent().ok_or_else(invalid)?)?;
+     if !parent.is_dir() || parent.mode() & 0o027 != 0 {
+@@ -91,6 +102,7 @@ impl State {
+                         enabled: true,
+                         download_mbps: 0,
+                         upload_mbps: 0,
++                        expires_at: None,
+                         revision: 1,
+                         max_http2_conns: c.max_http2_conns,
+                         max_http3_conns: c.max_http3_conns,
+@@ -122,6 +134,7 @@ impl State {
+                 || u.revision == 0
+                 || u.download_mbps > 1000000
+                 || u.upload_mbps > 1000000
++                || expiry_millis(u.expires_at.as_deref()).is_err()
+                 || !names.insert(&u.username)
+                 || !ids.insert(&u.id)
+             {
+@@ -152,7 +165,7 @@ impl State {
+         std::fs::File::open(parent)?.sync_all()
+     }
+     fn public(&self) -> serde_json::Value {
+-        serde_json::json!({"version":1,"generation":self.generation,"capabilities":{"hot_reload":true,"disconnect_user":true,"speed_limits":true,"durable_quotas":false,"expiry":false},"users":self.users.iter().map(|u|serde_json::json!({"id":u.id,"username":u.username,"revision":u.revision,"enabled":u.enabled,"download_mbps":u.download_mbps,"upload_mbps":u.upload_mbps})).collect::<Vec<_>>()})
++        serde_json::json!({"version":1,"generation":self.generation,"capabilities":{"hot_reload":true,"disconnect_user":true,"speed_limits":true,"durable_quotas":false,"expiry":true},"users":self.users.iter().map(|u|serde_json::json!({"id":u.id,"username":u.username,"revision":u.revision,"enabled":u.enabled,"download_mbps":u.download_mbps,"upload_mbps":u.upload_mbps,"expires_at":u.expires_at,"expired":expiry_millis(u.expires_at.as_deref()).ok().flatten().is_some_and(|at| chrono::Utc::now().timestamp_millis() >= at)})).collect::<Vec<_>>()})
+     }
+ }
+ impl Management {
+@@ -184,6 +197,8 @@ impl Management {
+                     enabled: u.enabled,
+                     download_mbps: u.download_mbps,
+                     upload_mbps: u.upload_mbps,
++                    expires_at_unix_ms: expiry_millis(u.expires_at.as_deref())
++                        .expect("validated expiry"),
+                 })
+                 .collect::<Vec<_>>(),
+         );
+@@ -347,6 +362,17 @@ impl Drop for SocketGuard {
+ mod tests {
+     use super::*;
+     #[test]
++    fn expiry_parsing_rejects_bad_dates_and_preserves_offsets() {
++        assert_eq!(expiry_millis(None).unwrap(), None);
++        assert_eq!(
++            expiry_millis(Some("2030-01-01T03:00:00+03:00")).unwrap(),
++            expiry_millis(Some("2030-01-01T00:00:00Z")).unwrap()
++        );
++        assert!(expiry_millis(Some("")).is_err());
++        assert!(expiry_millis(Some("2030-02-30T00:00:00Z")).is_err());
++        assert!(expiry_millis(Some("2030-01-01")).is_err());
++    }
++    #[test]
+     fn saved_state_is_private_and_public_response_contains_no_secrets() {
+         let dir = tempfile::tempdir().unwrap();
+         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+@@ -361,6 +387,7 @@ mod tests {
+                 enabled: true,
+                 download_mbps: 2,
+                 upload_mbps: 1,
++                expires_at: Some("2030-01-01T00:00:00Z".into()),
+                 revision: 2,
+                 max_http2_conns: None,
+                 max_http3_conns: None,
+@@ -373,6 +400,10 @@ mod tests {
+         let loaded = State::load_or_import(&path, &[]).unwrap();
+         assert_eq!(loaded.generation, 3);
+         assert_eq!(loaded.users[0].download_mbps, 2);
++        assert_eq!(
++            loaded.users[0].expires_at.as_deref(),
++            Some("2030-01-01T00:00:00Z")
++        );
+         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+         assert!(State::load_or_import(&path, &[]).is_err());
+     }
+diff --git a/lib/src/pipe.rs b/lib/src/pipe.rs
+index df89393..073bcd7 100644
+--- a/lib/src/pipe.rs
++++ b/lib/src/pipe.rs
+@@ -366,6 +366,7 @@ mod managed_tests {
+             enabled: true,
+             download_mbps: 1,
+             upload_mbps: 1,
++            expires_at_unix_ms: None,
+         }]);
+         let session = control.session();
+         let user = session.bind("alice").unwrap().unwrap();
+diff --git a/lib/src/traffic_control.rs b/lib/src/traffic_control.rs
+index 3d254b9..6e0cbe2 100644
+--- a/lib/src/traffic_control.rs
++++ b/lib/src/traffic_control.rs
+@@ -15,6 +15,13 @@ pub struct TrafficPolicy {
+     pub enabled: bool,
+     pub download_mbps: u32,
+     pub upload_mbps: u32,
++    #[serde(default)]
++    pub expires_at_unix_ms: Option<i64>,
++}
++
++struct Expiry {
++    at: Option<i64>,
++    elapsed: bool,
+ }
+ 
+ struct Bucket {
+@@ -52,8 +59,34 @@ pub(crate) struct UserControl {
+     download: Mutex<Bucket>,
+     upload: Mutex<Bucket>,
+     changed: watch::Sender<u64>,
++    expiry: Mutex<Expiry>,
+ }
+ impl UserControl {
++    fn active_at(&self, now: i64) -> bool {
++        let mut expiry = self.expiry.lock().unwrap();
++        expiry.elapsed |= expiry.at.is_some_and(|at| now >= at);
++        self.enabled.load(Ordering::Acquire) && !expiry.elapsed
++    }
++    fn active(&self) -> bool {
++        self.active_at(chrono::Utc::now().timestamp_millis())
++    }
++    async fn unavailable(&self) {
++        let mut changed = self.changed.subscribe();
++        loop {
++            changed.borrow_and_update();
++            if !self.active() {
++                return;
++            }
++            let at = self.expiry.lock().unwrap().at;
++            if let Some(at) = at {
++                let remaining = at.saturating_sub(chrono::Utc::now().timestamp_millis());
++                let delay = Duration::from_millis(remaining.clamp(1, 1000) as u64);
++                tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = changed.changed() => {} }
++            } else if changed.changed().await.is_err() {
++                return;
++            }
++        }
++    }
+     pub(crate) fn refund(&self, direction: SimplexDirection, bytes: usize) {
+         let mut b = match direction {
+             SimplexDirection::Incoming => self.download.lock().unwrap(),
+@@ -68,9 +101,22 @@ impl UserControl {
+             download: Mutex::new(Bucket::new(p.download_mbps)),
+             upload: Mutex::new(Bucket::new(p.upload_mbps)),
+             changed: watch::channel(0).0,
++            expiry: Mutex::new(Expiry {
++                at: p.expires_at_unix_ms,
++                elapsed: false,
++            }),
+         }
+     }
+     fn update(&self, p: &TrafficPolicy) {
++        {
++            let mut expiry = self.expiry.lock().unwrap();
++            if expiry.at != p.expires_at_unix_ms {
++                *expiry = Expiry {
++                    at: p.expires_at_unix_ms,
++                    elapsed: false,
++                };
++            }
++        }
+         self.download.lock().unwrap().update(p.download_mbps);
+         self.upload.lock().unwrap().update(p.upload_mbps);
+         self.enabled.store(p.enabled, Ordering::Release);
+@@ -81,9 +127,12 @@ impl UserControl {
+         direction: SimplexDirection,
+         mut bytes: usize,
+     ) -> io::Result<()> {
++        if !self.active() {
++            return Err(io::ErrorKind::PermissionDenied.into());
++        }
+         let mut changed = self.changed.subscribe();
+         while bytes > 0 {
+-            if !self.enabled.load(Ordering::Acquire) {
++            if !self.active() {
+                 return Err(io::ErrorKind::PermissionDenied.into());
+             }
+             changed.borrow_and_update();
+@@ -108,7 +157,7 @@ impl UserControl {
+                 }
+             };
+             if let Some(delay) = delay {
+-                tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = changed.changed() => {} }
++                tokio::select! { _ = tokio::time::sleep(delay.min(Duration::from_secs(1))) => {}, _ = changed.changed() => {} }
+             }
+         }
+         Ok(())
+@@ -126,6 +175,7 @@ pub(crate) struct ManagedSession {
+     owner: Mutex<Option<String>>,
+     cancel: watch::Sender<bool>,
+     control: Weak<TrafficControl>,
++    bound: watch::Sender<Option<Arc<UserControl>>>,
+ }
+ impl Drop for ManagedSession {
+     fn drop(&mut self) {
+@@ -140,9 +190,20 @@ impl ManagedSession {
+     }
+     pub(crate) async fn cancelled(&self) {
+         let mut rx = self.cancel.subscribe();
+-        while !*rx.borrow_and_update() {
+-            if rx.changed().await.is_err() {
+-                break;
++        let mut bound = self.bound.subscribe();
++        loop {
++            if *rx.borrow_and_update() {
++                return;
++            }
++            let user = bound.borrow_and_update().clone();
++            if let Some(user) = user {
++                tokio::select! {
++                    _ = rx.changed() => {},
++                    _ = bound.changed() => {},
++                    _ = user.unavailable() => { self.close(); return; }
++                }
++            } else {
++                tokio::select! { _ = rx.changed() => {}, _ = bound.changed() => {} }
+             }
+         }
+     }
+@@ -157,13 +218,16 @@ impl ManagedSession {
+         };
+         let user = policies
+             .get(username)
+-            .filter(|u| u.enabled.load(Ordering::Acquire))
++            .filter(|u| u.active())
+             .cloned()
+             .ok_or(io::ErrorKind::PermissionDenied)?;
+         let mut owner = self.owner.lock().unwrap();
+         if *self.cancel.borrow() || owner.as_ref().is_some_and(|u| u != username) {
+             return Err(io::ErrorKind::PermissionDenied.into());
+         }
++        if owner.is_none() {
++            self.bound.send_replace(Some(user.clone()));
++        }
+         *owner = Some(username.into());
+         Ok(Some(user))
+     }
+@@ -198,10 +262,7 @@ impl TrafficControl {
+             .collect();
+         for session in sessions {
+             if let Some(name) = session.owner.lock().unwrap().as_ref() {
+-                if !old
+-                    .get(name)
+-                    .is_some_and(|u| u.enabled.load(Ordering::Acquire))
+-                {
++                if !old.get(name).is_some_and(|u| u.active()) {
+                     session.cancel.send_replace(true);
+                 }
+             }
+@@ -233,6 +294,7 @@ impl TrafficControl {
+             owner: Mutex::new(None),
+             cancel: watch::channel(false).0,
+             control: Arc::downgrade(self),
++            bound: watch::channel(None).0,
+         });
+         self.sessions
+             .lock()
+@@ -251,8 +313,59 @@ mod tests {
+             enabled: true,
+             download_mbps: 1,
+             upload_mbps: 1,
++            expires_at_unix_ms: None,
+         }
+     }
++    #[test]
++    fn expiry_boundary_latches_until_the_deadline_changes() {
++        let mut p = policy("alice");
++        p.expires_at_unix_ms = Some(2000);
++        let user = UserControl::new(&p);
++        assert!(user.active_at(1999));
++        assert!(!user.active_at(2000));
++        assert!(!user.active_at(1000));
++        user.update(&p);
++        assert!(!user.active_at(1000));
++        p.expires_at_unix_ms = Some(3000);
++        user.update(&p);
++        assert!(user.active_at(2001));
++        p.expires_at_unix_ms = None;
++        user.update(&p);
++        assert!(user.active_at(i64::MAX));
++    }
++    #[tokio::test]
++    async fn expiry_closes_idle_sessions_and_extension_wakes_old_timers() {
++        let c = Arc::new(TrafficControl::default());
++        let mut p = policy("alice");
++        p.expires_at_unix_ms = Some(chrono::Utc::now().timestamp_millis() + 1000);
++        c.replace(&[p.clone(), policy("bob")]);
++        let a = c.session();
++        let expiring_user = a.bind("alice").unwrap().unwrap();
++        let wait = tokio::spawn({
++            let a = a.clone();
++            async move { a.cancelled().await }
++        });
++        p.expires_at_unix_ms = Some(chrono::Utc::now().timestamp_millis() + 2000);
++        c.replace(&[p.clone(), policy("bob")]);
++        tokio::time::sleep(Duration::from_millis(1100)).await;
++        assert!(!wait.is_finished());
++        tokio::time::timeout(Duration::from_secs(2), wait)
++            .await
++            .unwrap()
++            .unwrap();
++        assert!(c.session().bind("alice").is_err());
++        assert!(expiring_user
++            .acquire(SimplexDirection::Outgoing, 0)
++            .await
++            .is_err());
++        assert!(c.session().bind("bob").is_ok());
++        p.expires_at_unix_ms = None;
++        c.replace(&[p, policy("bob")]);
++        let renewed = c.session();
++        let user = renewed.bind("alice").unwrap().unwrap();
++        user.acquire(SimplexDirection::Incoming, 1).await.unwrap();
++        assert!(*a.cancel.borrow());
++    }
+     #[tokio::test(start_paused = true)]
+     async fn parallel_streams_share_bucket_and_directions_are_independent() {
+         let c = Arc::new(TrafficControl::default());
+diff --git a/lib/tests/managed.rs b/lib/tests/managed.rs
+index b354f00..f4caf6d 100644
+--- a/lib/tests/managed.rs
++++ b/lib/tests/managed.rs
+@@ -140,12 +140,14 @@ fn make_endpoint() -> (SocketAddr, common::File, Arc<Core>) {
+             enabled: true,
+             download_mbps: 2,
+             upload_mbps: 2,
++            expires_at_unix_ms: None,
+         },
+         TrafficPolicy {
+             username: "bob".into(),
+             enabled: true,
+             download_mbps: 0,
+             upload_mbps: 0,
++            expires_at_unix_ms: None,
+         },
+     ]);
+     (endpoint, cert, core)
+@@ -228,7 +230,7 @@ async fn h3_parallel_connections_share_upload_limit() {
+     Box::pin(shared_rate_over_transport(true, true)).await;
+ }
+ 
+-fn connect_request(target: SocketAddr, username: &str) -> Request<hyper::Body> {
++fn connect_request(target: impl ToString, username: &str) -> Request<hyper::Body> {
+     Request::builder()
+         .method("CONNECT")
+         .uri(target.to_string())
+@@ -244,7 +246,7 @@ fn connect_request(target: SocketAddr, username: &str) -> Request<hyper::Body> {
+ }
+ async fn h2_echo(
+     endpoint: SocketAddr,
+-    target: SocketAddr,
++    target: impl ToString,
+     name: &str,
+ ) -> (
+     hyper::client::conn::SendRequest<hyper::Body>,
+@@ -267,7 +269,29 @@ async fn h2_echo(
+     assert_eq!(resp.status(), http::StatusCode::OK);
+     (client, hyper::upgrade::on(resp).await.unwrap(), driver)
+ }
+-async fn targeted_kick(h3: bool) {
++fn close_alice(core: &Core, expiry: bool) {
++    if expiry {
++        core.traffic_control().replace(&[
++            TrafficPolicy {
++                username: "alice".into(),
++                enabled: true,
++                download_mbps: 0,
++                upload_mbps: 0,
++                expires_at_unix_ms: Some(chrono::Utc::now().timestamp_millis() + 250),
++            },
++            TrafficPolicy {
++                username: "bob".into(),
++                enabled: true,
++                download_mbps: 0,
++                upload_mbps: 0,
++                expires_at_unix_ms: None,
++            },
++        ]);
++    } else {
++        assert_eq!(core.traffic_control().disconnect("alice"), 1);
++    }
++}
++async fn targeted_kick(h3: bool, expiry: bool) {
+     let (endpoint, cert, core) = make_endpoint();
+     let server = tokio::spawn({
+         let core = core.clone();
+@@ -304,7 +328,7 @@ async fn targeted_kick(h3: bool) {
+                     .status,
+                 http::StatusCode::OK
+             );
+-            assert_eq!(core.traffic_control().disconnect("alice"), 1);
++            close_alice(&core, expiry);
+             tokio::time::timeout(Duration::from_secs(3), alice.wait_for_peer_close())
+                 .await
+                 .unwrap();
+@@ -315,7 +339,7 @@ async fn targeted_kick(h3: bool) {
+         } else {
+             let (_alice_client, mut alice, mut driver) = h2_echo(endpoint, target, "alice").await;
+             let (_bob_client, mut bob, bob_driver) = h2_echo(endpoint, target, "bob").await;
+-            assert_eq!(core.traffic_control().disconnect("alice"), 1);
++            close_alice(&core, expiry);
+             let mut ack = [0u8; 2];
+             let closed = tokio::time::timeout(Duration::from_secs(3), alice.read(&mut ack))
+                 .await
+@@ -340,9 +364,100 @@ async fn targeted_kick(h3: bool) {
+ }
+ #[tokio::test]
+ async fn h2_kick_closes_only_the_target_transport() {
+-    Box::pin(targeted_kick(false)).await;
++    Box::pin(targeted_kick(false, false)).await;
+ }
+ #[tokio::test]
+ async fn h3_kick_closes_only_the_target_transport() {
+-    Box::pin(targeted_kick(true)).await;
++    Box::pin(targeted_kick(true, false)).await;
++}
++#[tokio::test]
++async fn h2_expiry_closes_idle_transport_without_interrupting_bob() {
++    Box::pin(targeted_kick(false, true)).await;
++}
++#[tokio::test]
++async fn h3_expiry_closes_idle_transport_without_interrupting_bob() {
++    Box::pin(targeted_kick(true, true)).await;
++}
++
++async fn udp_expiry(h3: bool) {
++    use bytes::BufMut;
++    let (endpoint, cert, core) = make_endpoint();
++    let server = tokio::spawn({
++        let core = core.clone();
++        async move { core.listen().await.unwrap() }
++    });
++    let origin = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
++        .await
++        .unwrap();
++    let target = origin.local_addr().unwrap();
++    let origin_task = tokio::spawn(async move {
++        let mut b = [0u8; 512];
++        loop {
++            let (n, peer) = origin.recv_from(&mut b).await.unwrap();
++            origin.send_to(&b[..n], peer).await.unwrap();
++        }
++    });
++    let mut packet = Vec::new();
++    packet.put_u32(39);
++    packet.extend_from_slice(&[0; 12]);
++    packet.extend_from_slice(&Ipv4Addr::LOCALHOST.octets());
++    packet.put_u16(1234);
++    packet.extend_from_slice(&[0; 12]);
++    packet.extend_from_slice(&Ipv4Addr::LOCALHOST.octets());
++    packet.put_u16(target.port());
++    packet.put_u8(0);
++    packet.extend_from_slice(b"ok");
++    tokio::time::sleep(Duration::from_millis(200)).await;
++    let work = async {
++        if h3 {
++            let mut alice = common::Http3Session::connect(&endpoint, "localhost", None).await;
++            alice.send_request(connect_request("_udp2", "alice")).await;
++            assert_eq!(
++                alice
++                    .recv_response_with_method(&http::Method::CONNECT)
++                    .await
++                    .status,
++                http::StatusCode::OK
++            );
++            alice.send(futures::stream::iter([packet])).await;
++            let mut received = Vec::new();
++            let mut chunk = [0u8; 512];
++            while received.len() < 42 {
++                let n = alice.recv(&mut chunk).await;
++                assert!(n > 0);
++                received.extend_from_slice(&chunk[..n]);
++            }
++            assert!(received.ends_with(b"ok"));
++            close_alice(&core, true);
++            tokio::time::timeout(Duration::from_secs(3), alice.wait_for_peer_close())
++                .await
++                .unwrap();
++        } else {
++            let (_client, mut alice, driver) = h2_echo(endpoint, "_udp2", "alice").await;
++            alice.write_all(&packet).await.unwrap();
++            let mut ack = [0u8; 42];
++            alice.read_exact(&mut ack).await.unwrap();
++            assert!(ack.ends_with(b"ok"));
++            close_alice(&core, true);
++            let result = tokio::time::timeout(Duration::from_secs(3), alice.read(&mut ack))
++                .await
++                .unwrap();
++            assert!(result.is_err() || result.unwrap() == 0);
++            driver.abort();
++        }
++    };
++    tokio::time::timeout(Duration::from_secs(5), Box::pin(work))
++        .await
++        .unwrap();
++    server.abort();
++    origin_task.abort();
++    drop(cert);
++}
++#[tokio::test]
++async fn h2_expiry_closes_udp_mux_after_real_datagram() {
++    Box::pin(udp_expiry(false)).await;
++}
++#[tokio::test]
++async fn h3_expiry_closes_udp_mux_after_real_datagram() {
++    Box::pin(udp_expiry(true)).await;
+ }
