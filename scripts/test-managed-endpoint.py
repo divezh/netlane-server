@@ -145,7 +145,7 @@ with tempfile.TemporaryDirectory(prefix="tt-managed-") as temporary:
         users = {}
         policy = {"enabled": True, "download_mbps": 2, "upload_mbps": 1, "quota_bytes": 0}
         for username in ("alice", "bob"):
-            user = api("POST", "/api/v1/users", {"username": username, "password": "test-vpn-password-123", "policy": policy}, 201)["user"]
+            user = api("POST", "/api/v1/users", {"username": username, "password": "test-vpn-password-123", "group_id": "all", "policy": policy}, 201)["user"]
             users[username] = user
             assert api("POST", f'/api/v1/users/{user["id"]}/apply', {})["vpn_applied"]
 
@@ -177,7 +177,7 @@ with tempfile.TemporaryDirectory(prefix="tt-managed-") as temporary:
         assert sum(e["action"] == "user.profile_exported" for e in events) == 2
         assert "test-vpn-password-123" not in json.dumps(events)
         special_password = 'x'*64 + '\\"\n\x01кириллица'
-        special = api("POST", "/api/v1/users", {"username": "z-special", "password": special_password, "policy": policy}, 201)["user"]
+        special = api("POST", "/api/v1/users", {"username": "z-special", "password": special_password, "group_id": "all", "policy": policy}, 201)["user"]
         assert api("POST", f'/api/v1/users/{special["id"]}/apply', {})["vpn_applied"]
         special_profile = api("POST", f'/api/v1/users/{special["id"]}/profile', {"protocol": "http2"})
         assert decode_link(special_profile["deep_link"])[6].decode() == special_password
@@ -230,7 +230,7 @@ with tempfile.TemporaryDirectory(prefix="tt-managed-") as temporary:
         echo_ok(bob)
         assert api("GET", "/api/v1/status")["capabilities"]["durable_quotas"]
         quota_policy=dict(policy,quota_bytes=18)
-        quota_user = api("POST", "/api/v1/users", {"username": "quota", "password":"test-vpn-password-123", "policy": quota_policy}, 201)["user"]
+        quota_user = api("POST", "/api/v1/users", {"username": "quota", "password":"test-vpn-password-123", "group_id": "all", "policy": quota_policy}, 201)["user"]
         api("POST", f'/api/v1/users/{quota_user["id"]}/apply', {})
         limited=connect("quota");echo_ok(limited);closed(limited);connect("quota",accepted=False)
         assert api("POST", f'/api/v1/users/{quota_user["id"]}/profile', {"protocol":"http2"},409)["error"]=="user_quota_exhausted"
@@ -277,7 +277,7 @@ with tempfile.TemporaryDirectory(prefix="tt-managed-") as temporary:
         assert api("GET", "/api/v1/status")["capabilities"]["expiry"]
         original_deadline = datetime.now(timezone.utc) + timedelta(seconds=1.5)
         expiring_policy = dict(policy, expires_at=original_deadline.isoformat())
-        expiring = api("POST", "/api/v1/users", {"username": "zz-expiry", "password": "test-vpn-password-123", "policy": expiring_policy}, 201)["user"]
+        expiring = api("POST", "/api/v1/users", {"username": "zz-expiry", "password": "test-vpn-password-123", "group_id": "all", "policy": expiring_policy}, 201)["user"]
         assert api("POST", f'/api/v1/users/{expiring["id"]}/apply', {})["vpn_applied"]
         expiring_stream = connect("zz-expiry")
         echo_ok(expiring_stream)
@@ -315,7 +315,7 @@ with tempfile.TemporaryDirectory(prefix="tt-managed-") as temporary:
         echo_ok(connect("zz-expiry"))
 
         assert api("GET", "/api/v1/status")["capabilities"]["remove_user"]
-        victim=api("POST","/api/v1/users",{"username":"delete-me","password":"test-vpn-password-123","policy":policy},201)["user"]
+        victim=api("POST","/api/v1/users",{"username":"delete-me","password":"test-vpn-password-123","group_id":"all","policy":policy},201)["user"]
         api("POST",f'/api/v1/users/{victim["id"]}/apply',{})
         victim_stream=connect("delete-me");echo_ok(victim_stream)
         used_before=next(r for r in api("GET","/api/v1/usage")["records"] if r["user_id"]==victim["id"])["charged_bytes"]
@@ -333,7 +333,7 @@ with tempfile.TemporaryDirectory(prefix="tt-managed-") as temporary:
         assert any(e["action"]=="user.deleted" and e["target"]==victim["id"] for e in api("GET","/api/v1/audit")["events"])
         api("POST",f'/api/v1/users/{victim["id"]}/profile',{"protocol":"http2"},404)
         # An idempotent retry must not touch a newly created user with the same name.
-        replacement=api("POST","/api/v1/users",{"username":"delete-me","password":"test-vpn-password-123","policy":policy},201)["user"]
+        replacement=api("POST","/api/v1/users",{"username":"delete-me","password":"test-vpn-password-123","group_id":"all","policy":policy},201)["user"]
         assert replacement["id"]!=victim["id"]
         api("POST",f'/api/v1/users/{replacement["id"]}/apply',{})
         replacement_stream=connect("delete-me");echo_ok(replacement_stream)
