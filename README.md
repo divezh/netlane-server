@@ -7,6 +7,7 @@
 [![Release](https://img.shields.io/github/v/release/divezh/netlane-server?style=flat-square&color=22d3e6)](https://github.com/divezh/netlane-server/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/divezh/netlane-server/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/divezh/netlane-server/actions/workflows/ci.yml)
 ![Linux x64](https://img.shields.io/badge/server-Linux_x64-374151?style=flat-square)
+[![License: MIT](https://img.shields.io/badge/license-MIT-374151?style=flat-square)](LICENSE)
 
 [Документация](docs/README.md) · Клиенты: [Windows](https://github.com/divezh/netlane-windows) · [macOS](https://github.com/divezh/netlane-macos)
 
@@ -67,4 +68,6 @@ bash netlane-install/setup.sh --resume                           # продол�
 
 Выпуск: раздел версии в `CHANGELOG.md`, затем Actions → Release с тегом `netlane-X.Y.Z`.
 
-Проект независим от разработчиков TrustTunnel.
+## Лицензия
+
+[MIT](LICENSE). Патчи и исходники TrustTunnel в `upstream/` — [Apache 2.0](upstream/LICENSE.TrustTunnel). Проект независим от разработчиков TrustTunnel.
