@@ -38,6 +38,15 @@ SHA-256 открытого ключа (DER): `8c6ed42d682f9f6a48e7745b2a7a1935fe
    ```
 
    То же делает `scripts/sign-release.sh REPO TAG ФАЙЛ КЛЮЧ` (нужны `gh` и `openssl`).
+
+   Без `gh` и без скачивания файла: подпишите его SHA-256 из `.sha256` черновика и вставьте
+   подпись в Actions → «Publish signed release» (тег и `ИМЯ=ПОДПИСЬ`). Workflow сам проверит
+   подпись открытым ключом из репозитория, приложит `.sig` и опубликует черновик:
+
+   ```sh
+   printf '%s' "<sha256 из .sha256>" | xxd -r -p >hash.bin
+   openssl pkeyutl -sign -inkey netlane-release.key -in hash.bin -pkeyopt digest:sha256 | base64 -w0
+   ```
    Для клиентов файл — `Netlane-windows-x64.zip` и `Netlane-macos.zip`, подпись — `ИМЯ.sig`.
 3. После публикации релиз неизменяем (Immutable releases): ассеты нельзя заменить.
 

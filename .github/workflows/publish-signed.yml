@@ -1,0 +1,46 @@
+name: Publish signed release
+# The owner signs the release files off GitHub with the release key (docs: netlane-server/docs/SIGNING.md)
+# and pastes the signatures here. The workflow checks each signature against netlane-release.pub, attaches
+# it to the draft and publishes the draft. A wrong signature stops everything: nothing is published.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release tag (netlane-X.Y.Z or vX.Y.Z)
+        required: true
+      signatures:
+        description: 'ASSET=BASE64 pairs separated by spaces, e.g. Netlane-macos.zip=MEUCIQ…'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ inputs.tag }}
+      SIGNATURES: ${{ inputs.signatures }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Verify, attach and publish
+        run: |
+          set -euo pipefail
+          [[ $TAG =~ ^(netlane-|v)[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad tag"; exit 1; }
+          test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true || { echo "::error::$TAG is not a draft"; exit 1; }
+          mkdir -p work
+          for pair in $SIGNATURES; do
+            name=${pair%%=*}; value=${pair#*=}
+            [[ $name =~ ^[A-Za-z0-9._-]+$ && $name != *.sig ]] || { echo "::error::bad asset name $name"; exit 1; }
+            gh release download "$TAG" -p "$name" -D work --clobber
+            printf '%s' "$value" | base64 -d > "work/$name.sig"
+            openssl dgst -sha256 -verify netlane-release.pub -signature "work/$name.sig" "work/$name"
+          done
+          gh release upload "$TAG" work/*.sig --clobber
+          gh release edit "$TAG" --draft=false --latest
+          echo "::notice::$TAG published with the owner's signatures"
