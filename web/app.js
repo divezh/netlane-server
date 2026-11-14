@@ -226,7 +226,8 @@ function statisticsChart(points,key,{percent=false,bars=false,second=null}={}){
     return `<g>${down>0?`<rect class="statistics-download" x="${left}" y="${bottom}" width="${columnWidth}" height="${182-bottom}" rx="${rounded}"/>`:''}${up>0?`<rect class="statistics-upload" x="${left}" y="${top}" width="${columnWidth}" height="${bottom-top}" rx="${rounded}"/>`:''}</g>`;
   }).join(''):series(key,'download_bytes');
   const ticks=first===last?[points[0]]:[0,.33,.66,1].map(f=>points[Math.round(f*(points.length-1))]);
-  return `<svg viewBox="0 0 620 222" role="img" aria-label="${bars?'Потребление':'История'}: ${escapeHTML(name)}${second?` и ${escapeHTML(chartNames[second]||second)}`:''}">
+  // Над графиком без бейджа «выше шкалы» нечего показывать: верхний отступ срезается (fitTrafficCharts).
+  return `<svg viewBox="0 0 620 222" role="img"${clipped?'':' data-top="28"'} aria-label="${bars?'Потребление':'История'}: ${escapeHTML(name)}${second?` и ${escapeHTML(chartNames[second]||second)}`:''}">
     <rect class="chart-surface" x="74" y="40" width="528" height="142"/>
     ${(percent?[0,.25,.5,.75,1]:[0,1/3,2/3,1]).map(i=>`<line x1="74" x2="602" y1="${y(max*i)}" y2="${y(max*i)}" class="chart-grid"/><text class="chart-value" x="0" y="${y(max*i)+4}">${escapeHTML(label(max*i))}</text>`).join('')}
     ${columns}
@@ -503,15 +504,17 @@ function fitTrafficCharts(){
   for(const svg of document.querySelectorAll('.traffic-chart svg')){
     const shown=svg.clientWidth,tall=svg.clientHeight||222;
     if(shown<120)continue;
-    // The drawing is 222 units high; a shorter box (190 px in «Ресурсы сервера») would scale the whole
-    // picture down and leave empty sides, so the width in drawing units follows the box's proportions.
-    const width=shown*222/tall;
+    // The drawing is 222 units high (less the empty top a chart without a badge marks with data-top); a
+    // shorter box (190 px in «Ресурсы сервера») would scale the whole picture down and leave empty sides,
+    // so the width in drawing units follows the box's proportions.
+    const top=Number(svg.dataset.top)||0,high=222-top;
+    const width=shown*high/tall;
     // The plot starts right after the widest value label instead of a fixed 80 units.
     const labels=[...svg.querySelectorAll('text.chart-value')];
     let widest=0;for(const t of labels){try{widest=Math.max(widest,t.getComputedTextLength());}catch(e){}}
-    const left=Math.max(34,Math.ceil(widest)+10),right=12,plot=width-left-right;
+    const left=Math.max(36,Math.ceil(widest)+16),right=12,plot=width-left-right;
     const x=value=>left+(Number(value)-74)*plot/528;
-    svg.setAttribute('viewBox',`0 0 ${width} 222`);
+    svg.setAttribute('viewBox',`0 ${top} ${width} ${high}`);
     for(const node of svg.querySelectorAll('[x],[x1],[x2],[cx],[points],[width]')){
       if(node.classList.contains('chart-value'))continue;
       if(!node.chartGeometry)node.chartGeometry=Object.fromEntries(['x','x1','x2','cx','points','width'].filter(a=>node.hasAttribute(a)).map(a=>[a,node.getAttribute(a)]));
@@ -950,7 +953,7 @@ document.addEventListener('click',event=>{
   })();
 });
 const chartTip=(()=>{let node=null;const colors=['var(--accent)','#56c6a6'];return{show(hit,x,y){if(!node){node=document.createElement('div');node.className='chart-tip';node.hidden=true;document.body.appendChild(node);}const parts=String(hit.dataset.tip||'').split('|');node.textContent='';const head=document.createElement('div');head.className='chart-tip-time';head.textContent=parts[0]||'';node.appendChild(head);parts.slice(1).forEach((part,index)=>{const[title,value]=part.split('~');const row=document.createElement('div');row.className='chart-tip-row';const swatch=document.createElement('span');swatch.className='chart-tip-swatch';swatch.style.background=colors[index%colors.length];const label=document.createElement('span');label.textContent=title||'';const amount=document.createElement('span');amount.textContent=value||'';row.append(swatch,label,amount);node.appendChild(row);});node.hidden=false;const width=node.offsetWidth,height=node.offsetHeight;node.style.left=Math.max(8,Math.min(x+16,innerWidth-width-8))+'px';node.style.top=Math.max(8,Math.min(y-height/2,innerHeight-height-8))+'px';},hide(){if(node)node.hidden=true;}};})();
-document.addEventListener('mousemove',event=>{const svg=event.target instanceof Element?event.target.closest('svg'):null;const hits=svg?svg.querySelectorAll('.chart-hit'):null;if(!hits||!hits.length){chartTip.hide();return;}const box=svg.getBoundingClientRect(),pointer=(event.clientX-box.left)/box.width*620;let hit=null,best=Infinity;for(const candidate of hits){const centre=Number(candidate.getAttribute('x'))+Number(candidate.getAttribute('width'))/2,distance=Math.abs(centre-pointer);if(distance<best){best=distance;hit=candidate;}}const cursor=svg.querySelector('.chart-cursor');if(cursor){const centre=Number(hit.getAttribute('x'))+Number(hit.getAttribute('width'))/2;cursor.setAttribute('x1',centre);cursor.setAttribute('x2',centre);cursor.style.display='';}chartTip.show(hit,event.clientX,event.clientY);});
+document.addEventListener('mousemove',event=>{const svg=event.target instanceof Element?event.target.closest('svg'):null;const hits=svg?svg.querySelectorAll('.chart-hit'):null;if(!hits||!hits.length){chartTip.hide();return;}const box=svg.getBoundingClientRect(),view=svg.viewBox.baseVal,pointer=view.x+(event.clientX-box.left)/box.width*(view.width||620);let hit=null,best=Infinity;for(const candidate of hits){const centre=Number(candidate.getAttribute('x'))+Number(candidate.getAttribute('width'))/2,distance=Math.abs(centre-pointer);if(distance<best){best=distance;hit=candidate;}}const cursor=svg.querySelector('.chart-cursor');if(cursor){const centre=Number(hit.getAttribute('x'))+Number(hit.getAttribute('width'))/2;cursor.setAttribute('x1',centre);cursor.setAttribute('x2',centre);cursor.style.display='';}chartTip.show(hit,event.clientX,event.clientY);});
 document.addEventListener('mouseout',event=>{const svg=event.target instanceof Element?event.target.closest('svg'):null;if(!svg||(event.relatedTarget&&svg.contains(event.relatedTarget)))return;const cursor=svg.querySelector('.chart-cursor');if(cursor)cursor.style.display='none';});// Older audit pages stay until the page is reloaded; the regular refresh only replaces the newest page.
 document.addEventListener('click',event=>{const button=event.target.closest('#audit-more');if(!button)return;run(button,async()=>{const events=auditEvents();const page=await api('/audit?'+new URLSearchParams({before:events[events.length-1].id}));state.auditOlder=(state.auditOlder||[]).concat(page.events);state.auditOlderMore=page.more;render();});});
 // Node name and country: what clients show for the location.

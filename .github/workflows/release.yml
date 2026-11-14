@@ -83,7 +83,7 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true || { echo "::error::$TAG is already published; published releases are immutable"; exit 1; }
             gh release upload "$TAG" dist/* --clobber
-            gh release edit "$TAG" --title "$title" --notes-file notes.md
+            gh release edit "$TAG" --title "$title" --notes-file notes.md --target "$GITHUB_SHA"
           else
             gh release create "$TAG" dist/* --draft --title "$title" --notes-file notes.md --target "$GITHUB_SHA"
           fi
