@@ -16,6 +16,7 @@ import (
 
 	"github.com/divezh/netlane-server/internal/config"
 	"github.com/divezh/netlane-server/internal/decoy"
+	"github.com/divezh/netlane-server/internal/security"
 	"github.com/divezh/netlane-server/internal/store"
 )
 
@@ -151,10 +152,18 @@ func (f *syncFixture) sync(t *testing.T, token string, revision int64, acked []i
 func TestJoinThenSyncReturnsSnapshot(t *testing.T) {
 	f := newSyncFixture(t)
 	f.appliedUser(t, "alice", store.Policy{Enabled: true, DownloadMbps: 30})
-	_, token := f.join(t)
+	nodeID, token := f.join(t)
 	r := f.sync(t, token, 0, nil)
-	if r.Unchanged || r.Revision != 1 || len(r.Users) != 1 || r.Users[0].Password != "alice-password-123" || r.Users[0].DownloadMbps != 30 {
+	// The node gets its own password for alice, never the one the main server accepts.
+	if r.Unchanged || r.Revision != 1 || len(r.Users) != 1 || r.Users[0].Password != security.NodePassword("alice-password-123", nodeID) || r.Users[0].DownloadMbps != 30 {
 		t.Fatalf("%+v", r)
+	}
+	if r.Users[0].Password == "alice-password-123" || len(r.Users[0].Password) < 12 {
+		t.Fatalf("a node must not receive the main password: %+v", r.Users[0])
+	}
+	_, other := f.join(t)
+	if again := f.sync(t, other, 0, nil); again.Users[0].Password == r.Users[0].Password {
+		t.Fatal("two nodes must not share a password")
 	}
 }
 

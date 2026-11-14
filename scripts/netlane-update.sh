@@ -21,12 +21,26 @@ TOKEN_FILE=${NETLANE_TOKEN_FILE:-${WTT_TOKEN_FILE:-/etc/netlane-update/github-to
 LEGACY_TOKEN_FILE=/etc/wtt-update/github-token
 # The console leaves a request here; the systemd timer below runs this script with --requested.
 REQUESTED=/var/lib/trusttunnel-admin/update-requested
-# The updater reports its step here; the console reads it for the progress bar.
-STATUS=/var/lib/trusttunnel-admin/update-status.json
+# The updater reports its step here; the console reads it for the progress bar. The directory
+# belongs to root: root never writes into the console's own directory, where the console could
+# put a symlink in the way.
+REPORT_DIR=/var/lib/netlane-update/report
+STATUS=$REPORT_DIR/status.json
+# Where updaters before 0.6.1 wrote the report; removed (rm does not follow links).
+LEGACY_STATUS=/var/lib/trusttunnel-admin/update-status.json
 ADMIN=/opt/trusttunnel-admin/bin/trusttunnel-admin
 ENDPOINT=/opt/trusttunnel/bin/trusttunnel_endpoint
 BACKUP=/opt/trusttunnel-admin/bin/trusttunnel-backup
 MARKER=/opt/trusttunnel-admin/SOURCE_COMMIT
+# The release signing key (ECDSA P-256). Its private half never touches GitHub: a release is
+# installed only when trusttunnel-dev.tar.gz.sig verifies with this key, so a stolen GitHub
+# account or token cannot push code to servers. docs/SIGNING.md: how releases are signed.
+RELEASE_KEY='-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEtcoVFvdfswZyFlDqvHPR4ZS7wxQL
+q7iwNHtv+nx0GBdMsfRqNxJEEuOmJQhX8K87n59fJ8x5K7SFVPT3EbPWdg==
+-----END PUBLIC KEY-----'
+# Isolated tests sign with their own key; only root can set this, and root needs no updater.
+[[ -n ${NETLANE_RELEASE_KEY_FILE:-} ]] && RELEASE_KEY=$(cat -- "$NETLANE_RELEASE_KEY_FILE")
 
 bold=$'\e[1m' red=$'\e[31m' green=$'\e[32m' yellow=$'\e[33m' reset=$'\e[0m'
 [[ -t 1 ]] || { bold='' red='' green='' yellow='' reset=''; }
@@ -63,6 +77,8 @@ mb() { awk -v b="$1" 'BEGIN{printf "%.1f", b/1048576}' | tr . ,; }
 step_stages=() step_messages=() step_details=() step_times=()
 status() {
   local percent=$1 stage=$2 message=$3 detail=${4:-} now
+  # Only into the root-owned directory, and never through a link.
+  ((EUID == 0)) && [[ -d $REPORT_DIR && ! -L $REPORT_DIR && ! -L ${REPORT_DIR%/*} ]] || return 0
   now=$(date +%s)
   if [[ $stage != failed ]]; then
     local last=$(( ${#step_stages[@]} - 1 ))
@@ -91,8 +107,7 @@ report = {"stage": stage, "percent": None if percent == "null" else int(percent)
           "detail": detail, "version": version, "at": int(at), "steps": steps}
 if stage == "failed" and steps:
     report["failed_stage"] = steps[-1]["stage"]
-print(json.dumps(report, ensure_ascii=False))' >"$STATUS.tmp" 2>/dev/null && mv -f "$STATUS.tmp" "$STATUS" 2>/dev/null || return 0
-  chmod 0644 "$STATUS" 2>/dev/null || true
+print(json.dumps(report, ensure_ascii=False))' >"$STATUS.tmp" 2>/dev/null && chmod 0644 "$STATUS.tmp" && mv -f "$STATUS.tmp" "$STATUS" 2>/dev/null || return 0
 }
 
 # The console asks for an update by leaving $REQUESTED. A path unit starts the updater as
@@ -146,10 +161,16 @@ UNIT
     warn 'запуск обновления из панели не включился; обновляйте по SSH'
 }
 ((EUID == 0)) || die 'запустите от root: sudo netlane-update'
+# Readable by the console (it shows the report), writable by root only.
+install -d -m 0755 -o root -g root "${REPORT_DIR%/*}" "$REPORT_DIR"
+chmod 0755 "${REPORT_DIR%/*}"
+rm -f -- "$LEGACY_STATUS"
 install_update_timer
 
 if ((requested)); then
   # The console cannot install anything: it only leaves a request, and this run reads it.
+  # A link in place of the request is not a request: the console writes a plain file.
+  [[ -L $REQUESTED ]] && { rm -f -- "$REQUESTED"; exit 0; }
   [[ -f $REQUESTED ]] || exit 0
   requested_at=$(python3 -c 'import json,sys;print(int(json.load(open(sys.argv[1])).get("requested_at",0)))' "$REQUESTED" 2>/dev/null || echo 0)
   rm -f -- "$REQUESTED"
@@ -177,12 +198,8 @@ else role=main service=trusttunnel-admin; fi
 # The country database for client flags. install.sh has always installed it, but an
 # updated server never received it — and without the database the panel draws no flags
 # for anyone, because geoip-update and its timer were missing too.
-geoip_file=${NETLANE_GEOIP_FILE:-}
-if [[ -z $geoip_file ]]; then
-  geoip_file=$(python3 -c 'import json;print(json.load(open("/etc/trusttunnel-admin/config.json")).get("geoip_path",""))' 2>/dev/null || true)
-  geoip_file=${geoip_file:-/var/lib/trusttunnel-admin/geoip.mmdb}
-fi
-export NETLANE_GEOIP_FILE=$geoip_file
+# Root takes no path from the console's config.json: the console can rewrite that file.
+geoip_file=${NETLANE_GEOIP_FILE:-/var/lib/trusttunnel-admin/geoip.mmdb}
 geoip_ready() { [[ -s $geoip_file ]]; }
 
 # A release build knows its version; a development build only its commit.
@@ -217,31 +234,39 @@ api() { # api PATH [accept] [output]
 }
 
 if [[ -n $file ]]; then
-  [[ -f $file && -f $file.sha256 ]] || die "нужны $file и $file.sha256"
+  [[ -f $file && -f $file.sha256 && -f $file.sig ]] || die "нужны $file, $file.sha256 и $file.sig (подпись из того же релиза)"
   cp -- "$file" "$work/trusttunnel-dev.tar.gz"
   cp -- "$file.sha256" "$work/trusttunnel-dev.tar.gz.sha256"
+  cp -- "$file.sig" "$work/trusttunnel-dev.tar.gz.sig"
   tag=$(basename "$file")
 else
   # The only source: the latest published release of the public repository.
   if ! api "/repos/$REPO/releases/latest" '' "$work/release.json" 2>"$work/err"; then
     die "GitHub не отдал последний релиз $REPO: $(head -c 300 "$work/err"). Можно скачать trusttunnel-dev.tar.gz и .sha256 вручную и запустить netlane-update --file trusttunnel-dev.tar.gz"
   fi
-  read -r tag direct_url direct_sum sum_url notes_url < <(python3 - "$work/release.json" "$REPO" <<'PY'
+  read -r tag direct_url direct_sum sum_url notes_url sig_url < <(python3 - "$work/release.json" "$REPO" <<'PY'
 import json, sys
 r = json.load(open(sys.argv[1])); repo = sys.argv[2]
 assets = {a.get("name"): a for a in r.get("assets", [])}
-bundle = assets.get("trusttunnel-dev.tar.gz", {}); summ = assets.get("trusttunnel-dev.tar.gz.sha256", {})
+bundle = assets.get("trusttunnel-dev.tar.gz", {}); summ = assets.get("trusttunnel-dev.tar.gz.sha256", {}); sig = assets.get("trusttunnel-dev.tar.gz.sig", {})
 digest = (bundle.get("digest") or "").lower()
 print(r.get("tag_name", "-"), bundle.get("browser_download_url") or "-", digest[7:] if digest.startswith("sha256:") else "-",
-      summ.get("browser_download_url") or "-", r.get("html_url") or "-")
+      summ.get("browser_download_url") or "-", r.get("html_url") or "-", sig.get("browser_download_url") or "-")
 PY
 ) || die 'GitHub вернул неожиданный ответ о релизе'
   [[ $direct_sum == - ]] && direct_sum=''
   [[ $notes_url == - ]] && notes_url=''
   [[ $direct_url == "https://github.com/$REPO/releases/download/"* ]] || die "в релизе $tag нет trusttunnel-dev.tar.gz"
+  [[ $sig_url == "https://github.com/$REPO/releases/download/"* ]] || die "релиз $tag не подписан (нет trusttunnel-dev.tar.gz.sig): такой релиз не устанавливается"
   version=${tag#netlane-}; version=${version#v}
   [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "тег $tag не похож на версию"
   status 10 channel "Последний релиз: $version" "установлена $([[ $installed == unknown ]] && echo 'неизвестная версия' || { [[ $installed =~ ^[0-9a-f]{7,40}$ ]] && echo "сборка ${installed:0:7}" || echo "$installed"; })"
+  # Never go back: a «latest» release older than what runs here would bring old bugs back.
+  if [[ $installed =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $installed != "$version" && $(printf '%s\n%s\n' "$installed" "$version" | sort -V | tail -n1) == "$installed" ]]; then
+    say "${green}Установлена $installed, последний релиз $version старше — ничего не делаю.${reset}"
+    status 100 'done' "Установлена $installed, она новее последнего релиза $version"
+    exit 0
+  fi
   if [[ $installed =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $installed == "$version" ]]; then
     if geoip_ready; then
       say "${green}Установлена последняя версия $version.${reset}"
@@ -284,6 +309,7 @@ PY
     [[ $sum_url == "https://github.com/$REPO/releases/download/"* ]] || die "у релиза $tag нет контрольной суммы"
     curl -fsSL --proto '=https' --max-time 60 "$sum_url" -o "$work/trusttunnel-dev.tar.gz.sha256" || die 'не удалось скачать контрольную сумму'
   fi
+  curl -fsSL --proto '=https' --max-time 60 "$sig_url" -o "$work/trusttunnel-dev.tar.gz.sig" || die 'не удалось скачать подпись релиза'
 fi
 
 status 52 verify 'Проверяю контрольную сумму' 'SHA-256 из релиза'
@@ -292,6 +318,13 @@ expected=$(awk 'NR==1{print $1}' "$work/trusttunnel-dev.tar.gz.sha256")
 actual=$(sha256sum "$work/trusttunnel-dev.tar.gz" | awk '{print $1}')
 [[ $expected =~ ^[0-9a-f]{64}$ && $expected == "$actual" ]] || die "контрольная сумма не совпала: ожидалась ${expected:0:12}…, получена ${actual:0:12}…"
 status 55 verify 'Контрольная сумма совпала' "SHA-256 ${actual:0:16}…"
+status 56 verify 'Проверяю подпись релиза' 'ключ владельца Netlane (ECDSA P-256)'
+command -v openssl >/dev/null || die "нужен openssl для проверки подписи: apt-get install -y openssl"
+printf '%s\n' "$RELEASE_KEY" >"$work/release.pub"
+[[ $(stat -c %s "$work/trusttunnel-dev.tar.gz.sig") -le 128 ]] || die 'подпись релиза повреждена'
+openssl dgst -sha256 -verify "$work/release.pub" -signature "$work/trusttunnel-dev.tar.gz.sig" "$work/trusttunnel-dev.tar.gz" >/dev/null 2>&1 ||
+  die 'подпись релиза не прошла проверку: комплект не от владельца Netlane, установка остановлена'
+status 57 verify 'Подпись верна' 'комплект подписан ключом владельца' 
 status 58 unpack 'Распаковываю и проверяю программы'
 mkdir "$work/new"
 tar -xzf "$work/trusttunnel-dev.tar.gz" -C "$work/new"
@@ -300,12 +333,17 @@ for f in bin/trusttunnel-admin bin/trusttunnel_endpoint backup/trusttunnel-backu
 done
 new_commit=$(tr -dc '0-9a-f' <"$work/new/SOURCE_COMMIT")
 new_version=$("$work/new/bin/trusttunnel-admin" version 2>/dev/null) || die 'новая программа панели не запускается на этом сервере'
+# A signed old bundle under a new tag is still the old version: neither a mismatch nor a step back.
+if [[ -z $file && $new_version != "$version" ]]; then die "в релизе $version лежит комплект версии $new_version"; fi
+if [[ $installed =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $new_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $new_version != "$installed" && $(printf '%s\n%s\n' "$installed" "$new_version" | sort -V | tail -n1) == "$installed" ]]; then
+  die "комплект $new_version старше установленной $installed: откат не выполняется"
+fi
 status 62 unpack 'Программы проверены' "панель $new_version, сборка ${new_commit:0:7}"
 
 status 65 backup 'Делаю резервную копию' 'база, настройки и сертификаты'
 say 'Резервная копия…'
 "$BACKUP" >/dev/null || die 'резервная копия не создана, обновление остановлено'
-backup_name=$(find /var/backups/trusttunnel -maxdepth 1 -type f -name 'backup-*.tar.gz' -printf '%T@ %f\n' | sort -nr | sed -n '1s/^[^ ]* //p')
+backup_name=$(find /var/backups/trusttunnel -maxdepth 1 -type f \( -name 'backup-*.tar.gz' -o -name 'backup-*.tar.gz.age' \) -printf '%T@ %f\n' | sort -nr | sed -n '1s/^[^ ]* //p')
 say "  $backup_name"
 status 70 backup 'Резервная копия готова' "/var/backups/trusttunnel/$backup_name"
 

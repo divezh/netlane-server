@@ -2,6 +2,8 @@ module github.com/divezh/netlane-server
 
 go 1.26.0
 
+toolchain go1.26.11
+
 require (
 	github.com/oschwald/maxminddb-golang v1.13.1
 	golang.org/x/crypto v0.58.0

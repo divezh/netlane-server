@@ -20,12 +20,22 @@ jobs:
   go:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          go-version-file: go.mod
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          # The newest 1.26 patch release: the release binary is built here, with every
+          # standard library fix (go.mod's toolchain line is the floor for local builds).
+          go-version: '1.26'
+          check-latest: true
       - run: go test -race ./...
       - run: go vet ./...
+      - name: Known vulnerabilities (source and the built binary)
+        run: |
+          go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+          CGO_ENABLED=0 go build -o artifacts/vulncheck-admin ./cmd/trusttunnel-admin
+          go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 -mode=binary artifacts/vulncheck-admin
       - run: bash scripts/test-installer.sh
       - name: Test interactive setup and actual server binary
         run: |
@@ -34,10 +44,15 @@ jobs:
   upstream:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          go-version-file: go.mod
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          # The newest 1.26 patch release: the release binary is built here, with every
+          # standard library fix (go.mod's toolchain line is the floor for local builds).
+          go-version: '1.26'
+          check-latest: true
       - name: Fetch pinned upstream and apply patch
         run: |
           git clone https://github.com/TrustTunnel/TrustTunnel.git research/upstream
@@ -47,7 +62,8 @@ jobs:
           git -C research/upstream apply ../../upstream/patches/0003-managed-expiry.patch
           git -C research/upstream apply ../../upstream/patches/0004-durable-monthly-quota.patch
           git -C research/upstream apply ../../upstream/patches/0005-remove-managed-users.patch
-      - uses: actions/cache@v4
+          git -C research/upstream apply ../../upstream/patches/0006-dependency-security-updates.patch
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             research/upstream/target
@@ -58,7 +74,7 @@ jobs:
       - name: Build and test managed endpoint
         run: |
           mkdir -p artifacts .cache/cargo-registry
-          docker run --rm -v "$PWD/research/upstream:/src" -v "$PWD/.cache/cargo-registry:/usr/local/cargo/registry" -v "$PWD/artifacts:/out" tt-upstream-test bash -c 'cargo fmt --all -- --check && cargo clippy --locked -- -D warnings && cargo test --locked -p trusttunnel --lib && cargo test --locked -p trusttunnel --test managed && cargo test --locked -p trusttunnel_endpoint --bin trusttunnel_endpoint && cargo build --release --locked -p trusttunnel_endpoint && cp target/release/trusttunnel_endpoint /out/trusttunnel_endpoint'
+          docker run --rm -v "$PWD/research/upstream:/src" -v "$PWD/.cache/cargo-registry:/usr/local/cargo/registry" -v "$PWD/artifacts:/out" tt-upstream-test bash -c 'cargo install --locked cargo-audit@0.23.0 >/dev/null 2>&1 && cargo audit --ignore RUSTSEC-2026-0258 --ignore RUSTSEC-2025-0134 && cargo fmt --all -- --check && cargo clippy --locked -- -D warnings && cargo test --locked -p trusttunnel --lib && cargo test --locked -p trusttunnel --test managed && cargo test --locked -p trusttunnel_endpoint --bin trusttunnel_endpoint && cargo build --release --locked -p trusttunnel_endpoint && cp target/release/trusttunnel_endpoint /out/trusttunnel_endpoint'
       - name: Test panel and actual managed endpoint together
         run: |
           CGO_ENABLED=0 go build -o artifacts/trusttunnel-admin ./cmd/trusttunnel-admin
@@ -67,7 +83,7 @@ jobs:
         env:
           NETLANE_VERSION: ${{ inputs.version }}
         run: bash scripts/build-dev-bundle.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: install-bundle-linux-amd64
           path: |

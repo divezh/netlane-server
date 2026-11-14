@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"github.com/divezh/netlane-server/internal/update"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -147,6 +150,31 @@ type serviceInfo struct {
 	ServerName    string            `json:"server_name"`
 	ServerCountry string            `json:"server_country"`
 	Commands      map[string]string `json:"commands"`
+	// Backup is the last backup as trusttunnel-backup reported it; nil before the first one.
+	Backup *backupReport `json:"backup,omitempty"`
+}
+
+type backupReport struct {
+	At        string `json:"at"`
+	File      string `json:"file"`
+	Bytes     int64  `json:"bytes"`
+	Encrypted bool   `json:"encrypted"`
+}
+
+// lastBackup reads the report the root backup leaves in the updater's report directory.
+func lastBackup(dir string) *backupReport {
+	if dir == "" {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "backup.json"))
+	if err != nil || len(data) > 4096 {
+		return nil
+	}
+	var b backupReport
+	if json.Unmarshal(data, &b) != nil || b.At == "" {
+		return nil
+	}
+	return &b
 }
 
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
@@ -161,6 +189,7 @@ func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 		ServerName:    identity.ServerName,
 		ServerCountry: identity.ServerCountry,
 		Commands:      commands,
+		Backup:        lastBackup(s.reportDir),
 	})
 }
 
@@ -170,10 +199,10 @@ func maintenanceCommands() map[string]string {
 	return map[string]string{
 		"rename_domain": "Автоматической смены домена пока нет. Домен записан в настройках VPN, панели и сертификате, а у пользователей — в профилях.\nДля нового домена используйте отдельный чистый VPS и setup.sh, затем перенесите доступы и выдайте новые подписки. Не запускайте установщик поверх работающего сервера.",
 		"renew_tls":     "Сертификат продлевается автоматически (certbot.timer); хук обновляет TLS, перечитывает сертификат VPN и перезапускает панель или агент ноды.\nПроверка по SSH от root:\nsystemctl status certbot.timer\ncertbot renew --dry-run",
-		"backup":        "Резервная копия создаётся каждую ночь около 04:00 MSK (случайная задержка до 10 минут). Сделать её сейчас по SSH от root:\nsystemctl start trusttunnel-backup.service\nАрхивы лежат в /var/backups/trusttunnel (хранятся 14). В архиве ключи шифрования и TLS: копируйте его с VPS только в защищённое хранилище.",
-		"update": `Загрузите архив релиза и .sha256 в /root. Выполните на главном сервере и каждой ноде:
+		"backup":        "Резервная копия создаётся каждую ночь около 04:00 MSK (случайная задержка до 10 минут). Сделать её сейчас по SSH от root:\nsystemctl start trusttunnel-backup.service\nАрхивы лежат в /var/backups/trusttunnel (хранятся 14). В архиве ключи шифрования и TLS: включите шифрование age (docs/BACKUP.md) и забирайте копии с VPS.",
+		"update": `Загрузите из релиза trusttunnel-dev.tar.gz, .sha256 и .sig в /root. Выполните на главном сервере и каждой ноде:
 cd /root
-sha256sum -c trusttunnel-dev.tar.gz.sha256 &&
+` + update.VerifyCommand() + ` &&
 netlane_update_dir=$(mktemp -d /root/netlane-update.XXXXXX) &&
 tar -xzf trusttunnel-dev.tar.gz -C "$netlane_update_dir" &&
 bash "$netlane_update_dir/update.sh" --file /root/trusttunnel-dev.tar.gz

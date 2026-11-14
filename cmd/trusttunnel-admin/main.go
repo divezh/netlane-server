@@ -204,6 +204,21 @@ func run(args []string) error {
 	presenceDone := make(chan struct{})
 	go func() { api.TrackPresence(presenceCtx, cfg.MetricsAddress, db); close(presenceDone) }()
 	defer func() { stopPresence(); <-presenceDone }()
+	// The journal keeps a year of events: pruned at start and then daily.
+	go func() {
+		for {
+			if n, err := db.PruneAudit(presenceCtx, time.Now().Add(-store.AuditRetention)); err != nil {
+				log.Printf("audit: prune failed: %v", err)
+			} else if n > 0 {
+				log.Printf("audit: removed %d events older than a year", n)
+			}
+			select {
+			case <-presenceCtx.Done():
+				return
+			case <-time.After(24 * time.Hour):
+			}
+		}
+	}()
 	statisticsDone := make(chan struct{})
 	go func() { api.TrackStatistics(presenceCtx, cfg.MetricsAddress, cfg.Database, db); close(statisticsDone) }()
 	defer func() { stopPresence(); <-statisticsDone }()

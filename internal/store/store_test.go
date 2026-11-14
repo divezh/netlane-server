@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestPersistenceEncryptionAndRevision(t *testing.T) {
@@ -168,5 +169,24 @@ func TestNewerDatabaseIsNotSilentlyDowngraded(t *testing.T) {
 	if s, err = Open(path, key); err == nil {
 		s.Close()
 		t.Fatal("newer schema accepted")
+	}
+}
+
+func TestPruneAuditKeepsRecentEvents(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	if err := s.Audit(ctx, "admin", "auth.login", "192.0.2.1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(ctx, "INSERT INTO audit(happened_at,actor,action,target) VALUES(?,?,?,?)", "2020-01-01T00:00:00Z", "admin", "auth.login", "old"); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.PruneAudit(ctx, time.Now().Add(-AuditRetention))
+	if err != nil || n != 1 {
+		t.Fatalf("pruned %d, %v", n, err)
+	}
+	events, err := s.RecentAudit(ctx, 0)
+	if err != nil || len(events) != 1 || events[0].Target != "192.0.2.1" {
+		t.Fatalf("recent event must stay: %+v %v", events, err)
 	}
 }

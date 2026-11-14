@@ -108,6 +108,17 @@ func Parse(data []byte) (Manifest, error) {
 	if !sha256Pattern.MatchString(m.SHA256) {
 		return m, fmt.Errorf("release bundle has no checksum")
 	}
+	// An unsigned release is never installed (netlane-update checks the signature), so it is
+	// not offered either.
+	signed := false
+	for _, a := range r.Assets {
+		if a.Name == SignatureAsset {
+			signed = true
+		}
+	}
+	if !signed {
+		return m, fmt.Errorf("release has no %s", SignatureAsset)
+	}
 	m.Released = r.Published
 	m.Notes = Notes(r.Body)
 	if n, err := url.Parse(r.Page); err == nil && n.Scheme == "https" && n.Host == "github.com" && len(r.Page) <= 300 {
@@ -191,15 +202,24 @@ type Step struct {
 	At      int64  `json:"at"`
 }
 
-// ClearStatus forgets the report of a previous run before a new request.
+// ClearStatus forgets the report a former updater left in the panel data directory.
 func ClearStatus(dir string) {
 	_ = os.Remove(filepath.Join(dir, StatusFile))
 }
 
-// StatusFile holds the updater's report next to the request.
+// StatusFile is where updaters before 0.6.1 wrote their report: the panel data directory.
+// Root no longer writes there (the panel owns the directory and could plant a symlink); the
+// panel still reads it, because the update to 0.6.1 itself is run by the former updater.
 const StatusFile = "update-status.json"
 
-// Clear removes the request and the report once the console has shown them.
+// ReportDir holds the updater's report. Root owns it (0755) and writes into it; the panel only
+// reads, so nothing the panel controls is ever written by root.
+const ReportDir = "/var/lib/netlane-update/report"
+
+// ReportFile is the report inside ReportDir.
+const ReportFile = "status.json"
+
+// Clear removes the request and a former updater's report once the console has shown them.
 func Clear(dir string) {
 	for _, name := range []string{RequestFile, StatusFile} {
 		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
@@ -208,9 +228,26 @@ func Clear(dir string) {
 	}
 }
 
-// ReadStatus returns the updater's report, if it wrote one.
-func ReadStatus(dir string) (Status, bool) {
-	data, err := os.ReadFile(filepath.Join(dir, StatusFile))
+// ReadStatus returns the newest report: the root-owned one in reportDir or, from a former
+// updater, the one in the panel data directory.
+func ReadStatus(reportDir, dataDir string) (Status, bool) {
+	var best Status
+	found := false
+	names := []string{filepath.Join(dataDir, StatusFile)}
+	if reportDir != "" {
+		names = append(names, filepath.Join(reportDir, ReportFile))
+	}
+	for _, name := range names {
+		s, ok := readStatus(name)
+		if ok && (!found || s.At > best.At) {
+			best, found = s, true
+		}
+	}
+	return best, found
+}
+
+func readStatus(name string) (Status, bool) {
+	data, err := os.ReadFile(name)
 	if err != nil {
 		return Status{}, false
 	}

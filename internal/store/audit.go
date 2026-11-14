@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"math"
+	"time"
 )
 
 type AuditEvent struct {
@@ -35,4 +36,16 @@ func (s *Store) RecentAudit(ctx context.Context, before int64) ([]AuditEvent, er
 		events = append(events, event)
 	}
 	return events, rows.Err()
+}
+
+// AuditRetention is how long the journal keeps events; older ones are removed once a day.
+const AuditRetention = 365 * 24 * time.Hour
+
+// PruneAudit removes events older than before and reports how many went.
+func (s *Store) PruneAudit(ctx context.Context, before time.Time) (int64, error) {
+	result, err := s.db.ExecContext(ctx, "DELETE FROM audit WHERE happened_at<?", before.UTC().Format(time.RFC3339))
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }

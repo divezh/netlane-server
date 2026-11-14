@@ -14,6 +14,7 @@ import (
 
 	"github.com/divezh/netlane-server/internal/config"
 	"github.com/divezh/netlane-server/internal/endpoint"
+	"github.com/divezh/netlane-server/internal/security"
 	"github.com/divezh/netlane-server/internal/store"
 )
 
@@ -219,10 +220,10 @@ func (h *syncHandler) subscription(w http.ResponseWriter, r *http.Request, token
 			return
 		}
 		password := applied.Password
-		link := func(domain, name string) string {
+		link := func(domain, name, password string) string {
 			return profileLink(domain, net.JoinHostPort(domain, "443"), u.Username, password, "http2", false, name)
 		}
-		servers := []feedServer{{ID: "main", Name: mainName, Country: country, Link: link(h.cfg.Domain, mainName)}}
+		servers := []feedServer{{ID: "main", Name: mainName, Country: country, Link: link(h.cfg.Domain, mainName, password)}}
 		nodes, err := h.db.ListNodes(r.Context())
 		if err != nil {
 			problem(w, 500, "storage_error")
@@ -237,7 +238,7 @@ func (h *syncHandler) subscription(w http.ResponseWriter, r *http.Request, token
 				continue
 			}
 			nodeName := profileName(config.Config{ServerName: n.Name, ServerCountry: n.Country})
-			servers = append(servers, feedServer{ID: n.ID, Name: nodeName, Country: n.Country, Link: link(n.Domain, nodeName)})
+			servers = append(servers, feedServer{ID: n.ID, Name: nodeName, Country: n.Country, Link: link(n.Domain, nodeName, security.NodePassword(password, n.ID))})
 		}
 		feed["servers"] = servers
 		settings, err := h.db.ClientSettings(r.Context())

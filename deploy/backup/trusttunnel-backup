@@ -31,9 +31,28 @@ restore() {
 trap restore EXIT
 ((${#running[@]})) && systemctl stop "${running[@]}"
 tar -czf "$partial" -C / --exclude=var/lib/trusttunnel/managed.usage.lock "${paths[@]}"
-mv -- "$partial" "$dest/backup-$stamp.tar.gz"
-trap - EXIT
+trap 'rm -f -- "$partial" "$dest/.backup-$stamp.tar.gz.age.partial"' EXIT
 ((${#running[@]})) && systemctl start "${running[@]}"
+# With recipients in $recipients (age public keys, one per line) the archive is encrypted and
+# no plain copy stays on the VPS: whoever takes the server or the backup folder cannot read
+# the keys inside. The private age key stays with the owner. docs/BACKUP.md.
+recipients=${TT_BACKUP_RECIPIENTS:-/etc/netlane-backup/age-recipients}
+name="backup-$stamp.tar.gz" encrypted=false
+if [[ -s $recipients ]] && command -v age >/dev/null; then
+  age -R "$recipients" -o "$dest/.backup-$stamp.tar.gz.age.partial" "$partial"
+  rm -f -- "$partial"
+  name="backup-$stamp.tar.gz.age" encrypted=true
+  mv -- "$dest/.backup-$stamp.tar.gz.age.partial" "$dest/$name"
+else
+  [[ -s $recipients ]] && echo 'age is not installed: the backup is NOT encrypted (apt-get install age).' >&2
+  mv -- "$partial" "$dest/$name"
+fi
 # Keep the newest $keep archives.
-find "$dest" -maxdepth 1 -type f -name 'backup-*.tar.gz' -printf '%T@ %p\n' | sort -rn | tail -n +$((keep + 1)) | cut -d' ' -f2- | xargs -r rm -f --
-echo "Backup written: $dest/backup-$stamp.tar.gz ($(du -h "$dest/backup-$stamp.tar.gz" | cut -f1))"
+find "$dest" -maxdepth 1 -type f \( -name 'backup-*.tar.gz' -o -name 'backup-*.tar.gz.age' \) -printf '%T@ %p\n' | sort -rn | tail -n +$((keep + 1)) | cut -d' ' -f2- | xargs -r rm -f --
+# What the panel shows under «Сервер»: the report directory belongs to root, the panel reads it.
+report=/var/lib/netlane-update/report
+if install -d -m 0755 /var/lib/netlane-update "$report" 2>/dev/null && [[ ! -L $report ]]; then
+  printf '{"at":"%s","file":"%s","bytes":%s,"encrypted":%s}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$(stat -c %s "$dest/$name")" "$encrypted" >"$report/.backup.json.tmp" &&
+    chmod 0644 "$report/.backup.json.tmp" && mv -f "$report/.backup.json.tmp" "$report/backup.json"
+fi
+echo "Backup written: $dest/$name ($(du -h "$dest/$name" | cut -f1))$([[ $encrypted == true ]] && echo ', encrypted with age')"

@@ -30,7 +30,17 @@ import (
 type session struct {
 	csrf    string
 	expires time.Time
+	// What «Безопасность → Сеансы» shows; id is a public handle, never the cookie value.
+	id      string
+	created time.Time
+	seen    time.Time
+	ip      string
+	agent   string
 }
+
+// sessionIdle ends a session nobody has used for this long; sessions also end 8 h after login.
+const sessionIdle = 2 * time.Hour
+
 type attempt struct {
 	count int
 	since time.Time
@@ -62,6 +72,8 @@ type Server struct {
 	timerInstalled func() bool
 	// instantStart: the path unit that starts an update at once is installed (0.5.19+).
 	instantStart func() bool
+	// reportDir is where the root updater writes its progress (update.ReportDir); tests set their own.
+	reportDir string
 }
 
 // New builds the panel. hub wakes nodes on changes; nil makes a private one (tests, no nodes).
@@ -79,6 +91,7 @@ func New(cfg config.Config, db *store.Store, hub *Hub) (http.Handler, error) {
 	// granted by /etc/sudoers.d/netlane-update.
 	s.fetchManifest = func(ctx context.Context) (update.Manifest, error) { return update.Fetch(ctx, nil, update.Channel) }
 	s.requestUpdate = requestVersion(filepath.Dir(cfg.Database))
+	s.reportDir = update.ReportDir
 	s.timerInstalled = func() bool {
 		// A local stand can point at any file to see the card with its button; the update
 		// itself still needs the real timer, because only root may install it.
@@ -111,6 +124,8 @@ func New(cfg config.Config, db *store.Store, hub *Hub) (http.Handler, error) {
 	mux.Handle("POST /api/v1/auth/2fa/setup", s.auth(http.HandlerFunc(s.factorSetup)))
 	mux.Handle("POST /api/v1/auth/2fa", s.auth(http.HandlerFunc(s.factorChange)))
 	mux.Handle("POST /api/v1/auth/password", s.auth(http.HandlerFunc(s.changePassword)))
+	mux.Handle("GET /api/v1/auth/sessions", s.auth(http.HandlerFunc(s.listSessions)))
+	mux.Handle("POST /api/v1/auth/sessions/logout-others", s.auth(http.HandlerFunc(s.logoutOthers)))
 	mux.Handle("GET /api/v1/diagnostics", s.auth(http.HandlerFunc(s.diagnostics)))
 	mux.Handle("GET /api/v1/statistics", s.auth(http.HandlerFunc(s.statistics)))
 	mux.Handle("GET /api/v1/info", s.auth(http.HandlerFunc(s.info)))
@@ -163,6 +178,19 @@ func New(cfg config.Config, db *store.Store, hub *Hub) (http.Handler, error) {
 		mux.ServeHTTP(w, r)
 	}), nil
 }
+
+// allAttempts counts every login attempt in the current minute, whatever the address.
+const allAttempts = "*"
+
+// attemptKey is the address a login attempt is counted against: IPv4 as is, IPv6 by its /64.
+func attemptKey(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil || parsed.To4() != nil {
+		return ip
+	}
+	return parsed.Mask(net.CIDRMask(64, 128)).String() + "/64"
+}
+
 func (s *Server) sameOrigin(r *http.Request) bool {
 	if origin := r.Header.Get("Origin"); origin != "" {
 		u, err := url.Parse(origin)
@@ -185,14 +213,23 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 			delete(s.attempts, key)
 		}
 	}
-	a := s.attempts[ip]
+	// One IPv6 subscriber holds a whole /64: counting single addresses would let one client
+	// rotate through millions of them. All attempts together are capped as well.
+	key := attemptKey(ip)
+	a := s.attempts[key]
 	if a.since.IsZero() {
 		a.since = now
 	}
 	a.count++
-	s.attempts[ip] = a
+	s.attempts[key] = a
+	all := s.attempts[allAttempts]
+	if all.since.IsZero() {
+		all.since = now
+	}
+	all.count++
+	s.attempts[allAttempts] = all
 	s.mu.Unlock()
-	if a.count > 5 {
+	if a.count > 5 || all.count > 60 {
 		// Same journal format as a failed login, so fail2ban counts sustained guessing.
 		log.Printf("auth: login rate limited ip=%s", ip)
 		w.Header().Set("Retry-After", "60")
@@ -248,7 +285,11 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		return
 	}
-	s.sessions[token] = session{csrf: csrf, expires: now.Add(8 * time.Hour)}
+	agent := r.UserAgent()
+	if len(agent) > 160 {
+		agent = agent[:160]
+	}
+	s.sessions[token] = session{csrf: csrf, expires: now.Add(8 * time.Hour), id: security.Token(9), created: now, seen: now, ip: ip, agent: agent}
 	s.mu.Unlock()
 	log.Printf("auth: login ok user=%s ip=%s", logName(input.Username), ip)
 	if err := s.db.Audit(r.Context(), s.cfg.Admin, "auth.login", ip); err != nil {
@@ -266,9 +307,14 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		}
 		s.mu.Lock()
 		v, ok := s.sessions[c.Value]
-		if ok && time.Now().After(v.expires) {
+		now := time.Now()
+		if ok && (now.After(v.expires) || (!v.seen.IsZero() && now.Sub(v.seen) > sessionIdle)) {
 			delete(s.sessions, c.Value)
 			ok = false
+		}
+		if ok {
+			v.seen = now
+			s.sessions[c.Value] = v
 		}
 		s.mu.Unlock()
 		if !ok {

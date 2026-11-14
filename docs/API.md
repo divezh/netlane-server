@@ -10,6 +10,8 @@
 | POST | `/api/v1/auth/login` | JSON `username`, `password`; выдаёт HttpOnly-cookie и `csrf_token` |
 | POST | `/api/v1/auth/logout` | Завершает сессию |
 | GET | `/api/v1/auth/session` | Восстанавливает username и CSRF существующей HttpOnly-cookie-сессии |
+| GET | `/api/v1/auth/sessions` | Открытые сеансы панели: `id` (не значение cookie), `current`, `ip`, `agent`, `created_at`, `last_seen_at`, `expires_at`; `idle_minutes` |
+| POST | `/api/v1/auth/sessions/logout-others` | CSRF. Завершает все сеансы, кроме текущего; аудит `auth.sessions_revoked` |
 | POST | `/api/v1/auth/password` | JSON `current_password`, `new_password` (12–1024 байт) и CSRF. Сохраняет новый Argon2id-хеш в `config.json`, завершает остальные сессии, пишет `admin.password_changed` в аудит. До 5 попыток в минуту с IP |
 | GET | `/api/v1/audit?before=ID` | 100 событий в обратном порядке ID, без credentials; `before` — более ранняя страница, `more` — есть ли ещё. Неудачные входы — `auth.login_failed` с IP |
 | GET | `/api/v1/status` | Показывает готовые и ещё недоступные возможности |
@@ -38,7 +40,7 @@
 | GET | `/api/v1/client-settings` | Общие для всех подписок наборы правил и DNS: одна запись на главном сервере |
 | PUT | `/api/v1/client-settings` | JSON `revision` и настройки; 400 `invalid_client_settings`, 409 `client_settings_conflict` при устаревшей ревизии |
 
-Для POST/PUT после входа нужен заголовок `X-CSRF-Token`. JSON-запросы должны иметь `Content-Type: application/json`. Неизвестные поля и несколько JSON-объектов в одном запросе отклоняются. Вход ограничен пятью попытками в минуту на адрес; одновременно вычисляются не более двух Argon2-хешей. Сессии живут восемь часов и сбрасываются при перезапуске панели. TOTP и резервные коды настраиваются через `/api/v1/auth/2fa`.
+Для POST/PUT после входа нужен заголовок `X-CSRF-Token`. JSON-запросы должны иметь `Content-Type: application/json`. Неизвестные поля и несколько JSON-объектов в одном запросе отклоняются. Вход ограничен пятью попытками в минуту на адрес (IPv6 — на сеть /64) и 60 попытками в минуту всего; одновременно вычисляются не более двух Argon2-хешей. Сессии живут восемь часов, заканчиваются после двух часов без запросов и сбрасываются при перезапуске панели. Журнал хранит события год. TOTP и резервные коды настраиваются через `/api/v1/auth/2fa`.
 
 При наличии нод `GET /api/v1/users` добавляет каждому `locations: {applied, total}`, считая только локации его группы, а квота (`quota_bytes > 0`) в `POST`/`PUT` отклоняется кодом 409 `quota_not_supported_with_nodes`. `/usage` суммирует расход по main и нодам. «Отключить сессии» ставит команду каждой ноде.
 

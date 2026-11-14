@@ -32,12 +32,15 @@ Go + SQLite + systemd; Docker и Node.js не нужны.
 cd /root
 curl -fsSLO https://github.com/divezh/netlane-server/releases/latest/download/trusttunnel-dev.tar.gz
 curl -fsSLO https://github.com/divezh/netlane-server/releases/latest/download/trusttunnel-dev.tar.gz.sha256
+curl -fsSLO https://github.com/divezh/netlane-server/releases/latest/download/trusttunnel-dev.tar.gz.sig
+printf '%s\n' '-----BEGIN PUBLIC KEY-----' 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEtcoVFvdfswZyFlDqvHPR4ZS7wxQL' 'q7iwNHtv+nx0GBdMsfRqNxJEEuOmJQhX8K87n59fJ8x5K7SFVPT3EbPWdg==' '-----END PUBLIC KEY-----' >netlane-release.pub
 sha256sum -c trusttunnel-dev.tar.gz.sha256 &&
+openssl dgst -sha256 -verify netlane-release.pub -signature trusttunnel-dev.tar.gz.sig trusttunnel-dev.tar.gz &&
 mkdir -p netlane-install && tar -xzf trusttunnel-dev.tar.gz -C netlane-install &&
 bash netlane-install/setup.sh
 ```
 
-Мастер выдаст адрес панели и данные входа. Включите 2FA и создайте пользователя. Ноду в другой локации добавляют через «Ноды → Добавить ноду»: панель покажет готовую команду. [Ноды и подписка](docs/NODES.md).
+Релизы подписаны ключом владельца, которого нет на GitHub ([подпись релизов](docs/SIGNING.md)): `Verified OK` означает, что комплект настоящий. Мастер выдаст адрес панели и данные входа. Включите 2FA и создайте пользователя. Ноду в другой локации добавляют через «Ноды → Добавить ноду»: панель покажет готовую команду. [Ноды и подписка](docs/NODES.md).
 
 ## Обновление
 

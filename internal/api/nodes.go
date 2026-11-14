@@ -12,6 +12,7 @@ import (
 	"github.com/divezh/netlane-server/internal/config"
 	"github.com/divezh/netlane-server/internal/endpoint"
 	"github.com/divezh/netlane-server/internal/store"
+	"github.com/divezh/netlane-server/internal/update"
 )
 
 type nodeView struct {
@@ -87,7 +88,7 @@ func (s *Server) inviteNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	join := "https://" + s.cfg.Domain + "/" + s.cfg.SyncPrefix + "/node/join#" + code
-	command := `cd /root && sha256sum -c trusttunnel-dev.tar.gz.sha256 && netlane_node_dir=$(mktemp -d /root/netlane-node.XXXXXX) && tar -xzf trusttunnel-dev.tar.gz -C "$netlane_node_dir" && bash "$netlane_node_dir/setup.sh" --join '` + join + "'"
+	command := `cd /root && ` + update.VerifyCommand() + ` && netlane_node_dir=$(mktemp -d /root/netlane-node.XXXXXX) && tar -xzf trusttunnel-dev.tar.gz -C "$netlane_node_dir" && bash "$netlane_node_dir/setup.sh" --join '` + join + "'"
 	respond(w, 200, map[string]any{"command": command, "expires_at": expires.Format(time.RFC3339)})
 }
 

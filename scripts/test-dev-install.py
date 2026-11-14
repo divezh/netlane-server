@@ -204,8 +204,10 @@ def scenario(bundle, kind):
             else:raise AssertionError('Services not restored after test backup')
             print(f'PASS Ubuntu {args.ubuntu_version}: real renewal hook and backup unit',flush=True)
             # Run the actual file updater and preserve a locally customized schedule.
-            execute(name, "sed -i 's/^Description=.*/Description=Daily Netlane backup at legacy-zone/; s/^OnCalendar=.*/OnCalendar=*-*-* 01:17:00 UTC/' /etc/systemd/system/trusttunnel-backup.timer; systemctl daemon-reload; printf '%040d\\n' 1 >/root/netlane/SOURCE_COMMIT; tar -czf /root/update.tar.gz -C /root/netlane .; sha256sum /root/update.tar.gz >/root/update.tar.gz.sha256")
-            log.append(execute(name, 'bash /root/netlane/update.sh --file /root/update.tar.gz').stdout)
+            execute(name, "sed -i 's/^Description=.*/Description=Daily Netlane backup at legacy-zone/; s/^OnCalendar=.*/OnCalendar=*-*-* 01:17:00 UTC/' /etc/systemd/system/trusttunnel-backup.timer; systemctl daemon-reload; printf '%040d\\n' 1 >/root/netlane/SOURCE_COMMIT; tar -czf /root/update.tar.gz -C /root/netlane .; sha256sum /root/update.tar.gz >/root/update.tar.gz.sha256; openssl ecparam -name prime256v1 -genkey -noout -out /root/test-release.key; openssl ec -in /root/test-release.key -pubout -out /root/test-release.pub; openssl dgst -sha256 -sign /root/test-release.key -out /root/update.tar.gz.sig /root/update.tar.gz")
+            # A test bundle is signed with a throwaway key: the updater checks the signature as for a release.
+            log.append(execute(name, 'NETLANE_RELEASE_KEY_FILE=/root/test-release.pub bash /root/netlane/update.sh --file /root/update.tar.gz').stdout)
+            execute(name, "printf x >>/root/update.tar.gz.sig; ! NETLANE_RELEASE_KEY_FILE=/root/test-release.pub bash /root/netlane/update.sh --file /root/update.tar.gz")
             execute(name, "grep -F 'Description=Daily Netlane backup at 04:00 MSK' /etc/systemd/system/trusttunnel-backup.timer; grep -Fx 'OnCalendar=*-*-* 01:17:00 UTC' /etc/systemd/system/trusttunnel-backup.timer")
             print(f'PASS Ubuntu {args.ubuntu_version}: actual updater, MSK label and preserved custom schedule',flush=True)
         # A completed installation is not an updater. It must refuse both entry points.

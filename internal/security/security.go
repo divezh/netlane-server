@@ -3,7 +3,9 @@ package security
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
@@ -86,4 +88,13 @@ func Open(key []byte, userID, sealed string) (string, error) {
 	}
 	plain, err := gcm.Open(nil, data[:gcm.NonceSize()], data[gcm.NonceSize():], []byte(userID))
 	return string(plain), err
+}
+
+// NodePassword is the VPN password a user has on one node. Each node gets its own value,
+// derived from the user's password and the node ID: a node that is taken over gives away
+// access to that node only, never to the main server or to other locations.
+func NodePassword(password, nodeID string) string {
+	mac := hmac.New(sha256.New, []byte(password))
+	mac.Write([]byte("netlane-node-password:v1:" + nodeID))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }

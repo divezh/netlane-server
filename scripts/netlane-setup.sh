@@ -375,6 +375,19 @@ if ((swap_mb == 0 && mem_mb < 2048 && disk_free_mb > 4096)); then
 fi
 
 # ---- 3. Install bundle: next to the script, as a tarball, or the latest GitHub release --------
+# The owner's release signing key (docs/SIGNING.md): a bundle is installed only with a valid
+# trusttunnel-dev.tar.gz.sig. The private key is not on GitHub.
+RELEASE_KEY='-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEtcoVFvdfswZyFlDqvHPR4ZS7wxQL
+q7iwNHtv+nx0GBdMsfRqNxJEEuOmJQhX8K87n59fJ8x5K7SFVPT3EbPWdg==
+-----END PUBLIC KEY-----'
+verify_signature() { # verify_signature DIR — DIR holds trusttunnel-dev.tar.gz and its .sig
+  [[ -f $1/trusttunnel-dev.tar.gz.sig ]] || die "нет подписи trusttunnel-dev.tar.gz.sig: скачайте её из того же релиза."
+  command -v openssl >/dev/null || apt-get install -y -qq openssl >/dev/null 2>&1 || die 'нужен openssl для проверки подписи.'
+  printf '%s\n' "$RELEASE_KEY" >"$work/release.pub"
+  openssl dgst -sha256 -verify "$work/release.pub" -signature "$1/trusttunnel-dev.tar.gz.sig" "$1/trusttunnel-dev.tar.gz" >/dev/null 2>&1 ||
+    die 'подпись комплекта не прошла проверку: он не от владельца Netlane. Установка остановлена.'
+}
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 work=$(mktemp -d /root/netlane-setup.XXXXXX)
 cleanup() { rm -rf -- "$work"; }
@@ -385,6 +398,7 @@ if [[ -x $here/install.sh && -x $here/bin/trusttunnel-admin ]]; then
 elif [[ -f $here/trusttunnel-dev.tar.gz ]]; then
   [[ -f $here/trusttunnel-dev.tar.gz.sha256 ]] || die "рядом с trusttunnel-dev.tar.gz нет trusttunnel-dev.tar.gz.sha256."
   (cd "$here" && sha256sum -c --quiet trusttunnel-dev.tar.gz.sha256) || die 'контрольная сумма комплекта не совпала.'
+  verify_signature "$here"
   tar -xzf "$here/trusttunnel-dev.tar.gz" -C "$work"
   bundle=$work
 else
@@ -417,14 +431,15 @@ if [[ -z $bundle ]]; then
   tag=$(curl -fsS --proto '=https' -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$REPO/releases/latest" |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])') || die "GitHub не отдал последний релиз $REPO."
   [[ $tag =~ ^[A-Za-z0-9._-]+$ ]] || die "неожиданный тег релиза: $tag"
-  for name in trusttunnel-dev.tar.gz trusttunnel-dev.tar.gz.sha256; do
+  for name in trusttunnel-dev.tar.gz trusttunnel-dev.tar.gz.sha256 trusttunnel-dev.tar.gz.sig; do
     curl -fsSL --proto '=https' --max-time 600 -o "$work/$name" "https://github.com/$REPO/releases/download/$tag/$name" ||
       die "в релизе $tag нет файла $name."
   done
   (cd "$work" && sha256sum -c --quiet trusttunnel-dev.tar.gz.sha256) || die 'контрольная сумма скачанного комплекта не совпала.'
+  verify_signature "$work"
   mkdir "$work/bundle" && tar -xzf "$work/trusttunnel-dev.tar.gz" -C "$work/bundle"
   bundle=$work/bundle
-  say "Релиз $tag, SHA-256 совпала."
+  say "Релиз $tag: SHA-256 и подпись владельца верны."
 fi
 [[ -x $bundle/install.sh && -x $bundle/bin/trusttunnel-admin && -x $bundle/bin/trusttunnel_endpoint ]] || die 'комплект неполный.'
 

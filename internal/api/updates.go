@@ -84,7 +84,8 @@ func (s *Server) applyUpdate(w http.ResponseWriter, r *http.Request) {
 		problem(w, 503, "update_unavailable")
 		return
 	}
-	// A report of an earlier run must not stand in for this one.
+	// A report of an earlier run must not stand in for this one: the request below is newer
+	// than any report, so updateStatus shows the new run until the updater writes again.
 	update.ClearStatus(filepath.Dir(s.cfg.Database))
 	if err = s.requestUpdate(manifest.Version); err != nil {
 		log.Printf("update: cannot leave the request: %v", err)
@@ -103,7 +104,7 @@ func (s *Server) applyUpdate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) updateStatus() any {
 	dir := filepath.Dir(s.cfg.Database)
 	now := time.Now().Unix()
-	status, reported := update.ReadStatus(dir)
+	status, reported := update.ReadStatus(s.reportDir, dir)
 	pending, requested := update.ReadRequest(dir)
 	// A request newer than the last report is a new run the updater has not picked up yet.
 	if requested && (!reported || status.At < pending.RequestedAt) {

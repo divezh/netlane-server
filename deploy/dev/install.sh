@@ -172,6 +172,8 @@ fi
 install -d -m 0750 -o trusttunnel -g trusttunnel /etc/trusttunnel /run/trusttunnel
 install -d -m 0700 -o trusttunnel -g trusttunnel /var/lib/trusttunnel /etc/trusttunnel/tls
 install -d -m 0700 -o trusttunnel-admin -g trusttunnel-admin /etc/trusttunnel-admin /etc/trusttunnel-admin/tls /var/lib/trusttunnel-admin
+# The updater's report: root writes, the console reads (never root writing into the console's directory).
+install -d -m 0755 -o root -g root /var/lib/netlane-update /var/lib/netlane-update/report
 # Run as the real accounts before certificates, configs or database initialization.
 runuser -u trusttunnel -- /opt/trusttunnel/bin/trusttunnel_endpoint --version
 runuser -u trusttunnel-admin -- /opt/trusttunnel-admin/bin/trusttunnel-admin version

@@ -13,6 +13,7 @@ const validRelease = `{
   "html_url": "https://github.com/divezh/netlane-server/releases/tag/netlane-0.6.0",
   "body": "Что нового:\r\n\r\n- Обновления из **netlane-server**.\n- Без \u0060токена\u0060.\n\nПроверка происхождения: gh attestation verify",
   "assets": [
+    {"name": "trusttunnel-dev.tar.gz.sig", "browser_download_url": "https://github.com/divezh/netlane-server/releases/download/netlane-0.6.0/trusttunnel-dev.tar.gz.sig", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
     {"name": "trusttunnel-dev.tar.gz.sha256", "browser_download_url": "https://github.com/divezh/netlane-server/releases/download/netlane-0.6.0/trusttunnel-dev.tar.gz.sha256", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
     {"name": "trusttunnel-dev.tar.gz", "browser_download_url": "https://github.com/divezh/netlane-server/releases/download/netlane-0.6.0/trusttunnel-dev.tar.gz", "digest": "sha256:9F2C0C1D5B3A4E6F708192A3B4C5D6E7F8091A2B3C4D5E6F708192A3B4C5D6E7"}
   ]
@@ -44,6 +45,7 @@ func TestParseRefusesUnsafeRelease(t *testing.T) {
 		"plain http":   strings.Replace(validRelease, "\"https://github.com/divezh/netlane-server/releases/download/netlane-0.6.0/trusttunnel-dev.tar.gz\"", "\"http://github.com/divezh/netlane-server/releases/download/netlane-0.6.0/trusttunnel-dev.tar.gz\"", 1),
 		"no checksum":  strings.Replace(validRelease, `"sha256:9F2C0C1D5B3A4E6F708192A3B4C5D6E7F8091A2B3C4D5E6F708192A3B4C5D6E7"`, `null`, 1),
 		"no bundle":    strings.Replace(validRelease, `"name": "trusttunnel-dev.tar.gz",`, `"name": "other.tar.gz",`, 1),
+		"unsigned":     strings.Replace(validRelease, `"name": "trusttunnel-dev.tar.gz.sig",`, `"name": "other.sig",`, 1),
 		"dev tag":      strings.Replace(validRelease, `"netlane-0.6.0",`, `"dev-e73bc86",`, 1),
 		"pre-release":  strings.Replace(validRelease, `"prerelease": false`, `"prerelease": true`, 1),
 		"draft":        strings.Replace(validRelease, `"draft": false`, `"draft": true`, 1),

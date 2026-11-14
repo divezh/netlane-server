@@ -12,6 +12,8 @@
 | Прерванная установка, права и конфигурация | [Восстановление](INSTALLER-RECOVERY.md) |
 | Флаги стран у клиентов | [GeoIP](GEOIP.md) |
 | Обновления из панели и по SSH | [Обновления](UPDATES.md) |
+| Подпись релизов и проверка комплекта | [Подпись релизов](SIGNING.md) |
+| Резервные копии и их шифрование | [Резервные копии](BACKUP.md) |
 
 Команды установки — в [корневом README](../README.md), порядок обновления — в [UPDATES](UPDATES.md). Архивы и SHA256 — в [Releases](https://github.com/divezh/netlane-server/releases/latest).
 

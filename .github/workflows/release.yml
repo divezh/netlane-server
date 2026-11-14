@@ -11,23 +11,26 @@ on:
       tag:
         description: Tag to publish, e.g. netlane-0.4.3
         required: true
-permissions:
-  contents: write
-  actions: read
+# Each job gets only what it needs; only publish may write, and it creates a draft:
+# the owner signs the bundle off GitHub and publishes it (docs/SIGNING.md).
+permissions: {}
 concurrency:
   group: release
   cancel-in-progress: false
 jobs:
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.tag.outputs.version }}
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Tag
         id: tag
         run: |
@@ -39,21 +42,32 @@ jobs:
           fi
   ci:
     needs: check
+    permissions:
+      contents: read
     uses: ./.github/workflows/ci.yml
     with:
       version: ${{ needs.check.outputs.version }}
   publish:
     needs: [ci]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write      # the draft release
+      id-token: write      # build provenance
+      attestations: write
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ inputs.tag || github.ref_name }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: install-bundle-linux-amd64
           path: dist
+      - uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-path: dist/trusttunnel-dev.tar.gz
       - name: Publish
         run: |
           set -euo pipefail
@@ -64,9 +78,13 @@ jobs:
           # Notes come from CHANGELOG.md: the panel shows their bullet points as "Что нового".
           awk -v v="$version" '$0 ~ "^## " {on = ($2 == v); next} on' CHANGELOG.md >notes.md
           test -s notes.md || { echo "::error::CHANGELOG.md has no section ## $version"; exit 1; }
+          # A draft only: servers install a release only with the owner's signature
+          # (trusttunnel-dev.tar.gz.sig), which is made off GitHub; publishing follows it.
           if gh release view "$TAG" >/dev/null 2>&1; then
+            test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true || { echo "::error::$TAG is already published; published releases are immutable"; exit 1; }
             gh release upload "$TAG" dist/* --clobber
-            gh release edit "$TAG" --title "$title" --notes-file notes.md --latest
+            gh release edit "$TAG" --title "$title" --notes-file notes.md
           else
-            gh release create "$TAG" dist/* --title "$title" --notes-file notes.md --latest --target "$GITHUB_SHA"
+            gh release create "$TAG" dist/* --draft --title "$title" --notes-file notes.md --target "$GITHUB_SHA"
           fi
+          echo "::notice::Draft $TAG is ready: sign trusttunnel-dev.tar.gz and publish (docs/SIGNING.md)"

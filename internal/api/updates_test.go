@@ -141,10 +141,15 @@ func TestUpdateProgressReport(t *testing.T) {
 	s, _ := newUpdateServer(t, "0.5.18", update.Manifest{Version: "0.5.19"}, nil)
 	dir := t.TempDir()
 	s.cfg.Database = filepath.Join(dir, "panel.sqlite")
+	s.reportDir = t.TempDir()
 	now := time.Now().Unix()
 	write := func(name, body string) {
 		t.Helper()
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+		target := dir
+		if name == update.ReportFile {
+			target = s.reportDir
+		}
+		if err := os.WriteFile(filepath.Join(target, name), []byte(body), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -162,22 +167,45 @@ func TestUpdateProgressReport(t *testing.T) {
 	if p := progress(); p["stage"] != "requested" || p["waiting"].(float64) < 40 {
 		t.Fatalf("waiting request: %v", p)
 	}
-	write(update.StatusFile, fmt.Sprintf(`{"stage":"download","percent":31,"message":"Скачиваю комплект","detail":"4,2 из 12,7 МБ","at":%d,"steps":[{"stage":"accepted","message":"Запрос из панели принят","at":%d},{"stage":"download","message":"Скачиваю комплект","detail":"4,2 из 12,7 МБ","at":%d}]}`, now, now-2, now-1))
+	write(update.ReportFile, fmt.Sprintf(`{"stage":"download","percent":31,"message":"Скачиваю комплект","detail":"4,2 из 12,7 МБ","at":%d,"steps":[{"stage":"accepted","message":"Запрос из панели принят","at":%d},{"stage":"download","message":"Скачиваю комплект","detail":"4,2 из 12,7 МБ","at":%d}]}`, now, now-2, now-1))
 	if p := progress(); p["stage"] != "download" || p["detail"] != "4,2 из 12,7 МБ" || len(p["steps"].([]any)) != 2 {
 		t.Fatalf("running: %v", p)
 	}
 	os.Remove(filepath.Join(dir, update.RequestFile))
-	write(update.StatusFile, fmt.Sprintf(`{"stage":"done","percent":100,"message":"Готово: 0.5.19 установлена","at":%d}`, now-60))
+	write(update.ReportFile, fmt.Sprintf(`{"stage":"done","percent":100,"message":"Готово: 0.5.19 установлена","at":%d}`, now-60))
 	if p := progress(); p["stage"] != "done" {
 		t.Fatalf("a fresh report must stay on the card: %v", p)
 	}
-	write(update.StatusFile, fmt.Sprintf(`{"stage":"done","percent":100,"message":"Готово","at":%d}`, now-3600))
+	write(update.ReportFile, fmt.Sprintf(`{"stage":"done","percent":100,"message":"Готово","at":%d}`, now-3600))
 	if p := progress(); p != nil {
 		t.Fatalf("an old report must be cleared: %v", p)
 	}
-	write(update.StatusFile, fmt.Sprintf(`{"stage":"failed","percent":null,"message":"контрольная сумма не совпала","failed_stage":"verify","at":%d}`, now-30))
+	write(update.ReportFile, fmt.Sprintf(`{"stage":"failed","percent":null,"message":"контрольная сумма не совпала","failed_stage":"verify","at":%d}`, now-30))
 	write(update.RequestFile, fmt.Sprintf(`{"version":"0.5.19","requested_at":%d}`, now))
 	if p := progress(); p["stage"] != "requested" {
 		t.Fatalf("a retry must not be hidden by the old failure: %v", p)
+	}
+}
+
+// A server updated by the former updater has its report in the panel data directory: the
+// panel still shows it, and the newer of the two reports wins.
+func TestUpdateProgressLegacyReport(t *testing.T) {
+	s, _ := newUpdateServer(t, "0.6.0", update.Manifest{Version: "0.6.1"}, nil)
+	dir := t.TempDir()
+	s.cfg.Database = filepath.Join(dir, "panel.sqlite")
+	s.reportDir = t.TempDir()
+	now := time.Now().Unix()
+	if err := os.WriteFile(filepath.Join(dir, update.StatusFile), []byte(fmt.Sprintf(`{"stage":"install","percent":75,"message":"old","at":%d}`, now-5)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status, ok := update.ReadStatus(s.reportDir, dir)
+	if !ok || status.Message != "old" {
+		t.Fatalf("legacy report: %+v %v", status, ok)
+	}
+	if err := os.WriteFile(filepath.Join(s.reportDir, update.ReportFile), []byte(fmt.Sprintf(`{"stage":"done","percent":100,"message":"new","at":%d}`, now)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ = update.ReadStatus(s.reportDir, dir); status.Message != "new" {
+		t.Fatalf("the newer report must win: %+v", status)
 	}
 }

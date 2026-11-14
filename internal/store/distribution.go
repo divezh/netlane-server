@@ -118,7 +118,15 @@ func (s *Store) DistributedForNode(ctx context.Context, nodeID string) ([]Distri
 		return nil, err
 	}
 	defer rows.Close()
-	return s.scanDistributed(rows)
+	users, err := s.scanDistributed(rows)
+	if err != nil {
+		return nil, err
+	}
+	// A node gets only its own password for each user (security.NodePassword).
+	for i := range users {
+		users[i].Password = security.NodePassword(users[i].Password, nodeID)
+	}
+	return users, nil
 }
 
 func (s *Store) scanDistributed(rows *sql.Rows) ([]DistributedUser, error) {
