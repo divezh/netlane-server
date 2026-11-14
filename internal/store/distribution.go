@@ -54,6 +54,8 @@ type NodeReport struct {
 	Presence        []PresenceRow          `json:"presence"`
 	Acked           []int64                `json:"acked_commands"`
 	EndpointVersion string                 `json:"endpoint_version"`
+	// BlockBitTorrent is what the node's endpoint does now; nil when it cannot block.
+	BlockBitTorrent *bool `json:"block_bittorrent,omitempty"`
 }
 
 // Location is one node's confirmed revision of a user.

@@ -146,7 +146,12 @@ func (h *syncHandler) sync(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get(PollHeader) != "" {
 		wait = 0
 	}
-	if !h.pending(r.Context(), node.ID, report.Revision) && (wait == 0 || !h.hub.Wait(r.Context(), ticket, wait)) {
+	// A node whose BitTorrent blocking differs from the owner's choice is answered at once.
+	pending := h.pending(r.Context(), node.ID, report.Revision)
+	if want := h.blockBitTorrent(r.Context()); want != nil && report.BlockBitTorrent != nil && *want != *report.BlockBitTorrent {
+		pending = true
+	}
+	if !pending && (wait == 0 || !h.hub.Wait(r.Context(), ticket, wait)) {
 		if revision, err := h.db.UsersRevision(r.Context()); err == nil && revision == report.Revision {
 			respond(w, 200, map[string]any{"revision": revision, "unchanged": true, "block_bittorrent": h.blockBitTorrent(r.Context())})
 			return

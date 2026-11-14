@@ -39,6 +39,14 @@ func (m *memControl) Status(context.Context) (endpoint.ControlState, error) {
 	defer m.mu.Unlock()
 	s := m.state
 	s.Users = append([]endpoint.AppliedUser(nil), m.state.Users...)
+	s.Capabilities = map[string]bool{}
+	for k, v := range m.state.Capabilities {
+		s.Capabilities[k] = v
+	}
+	if m.state.Policy != nil {
+		policy := *m.state.Policy
+		s.Policy = &policy
+	}
 	return s, nil
 }
 
@@ -104,6 +112,11 @@ func (m *memControl) SyncBlockBitTorrent(_ context.Context, on bool) (bool, erro
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.blockBitTorrent = &on
+	if m.state.Capabilities == nil {
+		m.state.Capabilities = map[string]bool{}
+	}
+	m.state.Capabilities["block_bittorrent"] = true
+	m.state.Policy = &endpoint.Policy{BlockBitTorrent: on}
 	return true, nil
 }
 

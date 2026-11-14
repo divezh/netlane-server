@@ -191,6 +191,10 @@ func (a *Agent) report(ctx context.Context) store.NodeReport {
 	if err != nil {
 		return r
 	}
+	if state.Capabilities["block_bittorrent"] && state.Policy != nil {
+		on := state.Policy.BlockBitTorrent
+		r.BlockBitTorrent = &on
+	}
 	ids := map[string]string{}
 	for _, u := range state.Users {
 		r.Users = append(r.Users, store.UserRevision{ID: u.ID, Revision: u.Revision})
