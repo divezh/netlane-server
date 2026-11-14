@@ -204,6 +204,12 @@ func run(args []string) error {
 	presenceDone := make(chan struct{})
 	go func() { api.TrackPresence(presenceCtx, cfg.MetricsAddress, db); close(presenceDone) }()
 	defer func() { stopPresence(); <-presenceDone }()
+	// BitTorrent blocking: the stored choice follows the main endpoint (also after a reinstall).
+	if cfg.ControlSocket != "" {
+		if control, err := endpoint.NewControl(cfg.ControlSocket); err == nil {
+			go api.KeepPolicy(presenceCtx, control, db.BlockBitTorrent)
+		}
+	}
 	// The journal keeps a year of events: pruned at start and then daily.
 	go func() {
 		for {

@@ -40,6 +40,15 @@ type ControlState struct {
 	Capabilities map[string]bool `json:"capabilities"`
 	Users        []AppliedUser   `json:"users"`
 	Usage        *UsageMeta      `json:"usage,omitempty"`
+	// Policy is the endpoint-wide traffic policy; nil from an endpoint without the block_bittorrent capability.
+	Policy *Policy `json:"policy,omitempty"`
+}
+
+// Policy: BitTorrent blocking and what it has stopped since the endpoint started.
+type Policy struct {
+	BlockBitTorrent  bool   `json:"block_bittorrent"`
+	BlockedStreams   uint64 `json:"blocked_streams"`
+	BlockedDatagrams uint64 `json:"blocked_datagrams"`
 }
 type UsageMeta struct {
 	Month       string `json:"month"`
@@ -172,4 +181,30 @@ func (c *Control) Remove(ctx context.Context, generation uint64, id, username st
 		err = &ControlError{Code: "unsupported_version"}
 	}
 	return r.State, err
+}
+
+// SetBlockBitTorrent turns BitTorrent blocking on or off; the endpoint keeps it across restarts.
+func (c *Control) SetBlockBitTorrent(ctx context.Context, on bool) (ControlState, error) {
+	r, err := c.call(ctx, map[string]any{"op": "policy", "block_bittorrent": on})
+	if err == nil && r.State.Version != 1 {
+		err = &ControlError{Code: "unsupported_version"}
+	}
+	return r.State, err
+}
+
+// SyncBlockBitTorrent makes the endpoint follow the desired value when it supports the switch.
+// It reports whether the endpoint can block at all.
+func (c *Control) SyncBlockBitTorrent(ctx context.Context, on bool) (bool, error) {
+	state, err := c.Status(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !state.Capabilities["block_bittorrent"] {
+		return false, nil
+	}
+	if state.Policy != nil && state.Policy.BlockBitTorrent == on {
+		return true, nil
+	}
+	_, err = c.SetBlockBitTorrent(ctx, on)
+	return true, err
 }

@@ -20,13 +20,14 @@ import (
 
 // memControl is an in-memory managed endpoint with generation checks.
 type memControl struct {
-	mu        sync.Mutex
-	state     endpoint.ControlState
-	conflicts int // upserts to fail with generation_conflict
-	upserts   []string
-	removed   []string
-	dropped   []string
-	broken    string // upserts of this username always fail
+	mu              sync.Mutex
+	state           endpoint.ControlState
+	conflicts       int // upserts to fail with generation_conflict
+	upserts         []string
+	removed         []string
+	dropped         []string
+	broken          string // upserts of this username always fail
+	blockBitTorrent *bool
 }
 
 func newMem(users ...endpoint.AppliedUser) *memControl {
@@ -97,6 +98,13 @@ func (m *memControl) Remove(_ context.Context, gen uint64, id, username string, 
 	m.state.Generation++
 	m.mu.Unlock()
 	return m.Status(context.Background())
+}
+
+func (m *memControl) SyncBlockBitTorrent(_ context.Context, on bool) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.blockBitTorrent = &on
+	return true, nil
 }
 
 func (m *memControl) Disconnect(_ context.Context, username string) (int, error) {
@@ -188,6 +196,14 @@ func TestAgentEndToEnd(t *testing.T) {
 		report, err := db.LocationStatistics(ctx, nodeID, time.Now(), time.Hour, time.Now().UTC().Format("2006-01-02"))
 		return err == nil && report.Latest != nil && report.Latest.CPU != nil && *report.Latest.CPU == 26 && report.Latest.Cores == 4
 	})
+	// The owner's BitTorrent choice reaches the node with the next sync (on by default).
+	blocking := func() *bool { m.mu.Lock(); defer m.mu.Unlock(); return m.blockBitTorrent }
+	waitFor(t, func() bool { b := blocking(); return b != nil && *b })
+	if err = db.SetBlockBitTorrent(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	hub.Notify()
+	waitFor(t, func() bool { b := blocking(); return b != nil && !*b })
 	apply("bob")
 	waitFor(t, func() bool { return len(m.names()) == 2 })
 	if err = db.DeleteNode(ctx, "admin", nodeID); err != nil {

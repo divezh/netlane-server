@@ -10,6 +10,8 @@
 | POST | `/api/v1/auth/login` | JSON `username`, `password`; выдаёт HttpOnly-cookie и `csrf_token` |
 | POST | `/api/v1/auth/logout` | Завершает сессию |
 | GET | `/api/v1/auth/session` | Восстанавливает username и CSRF существующей HttpOnly-cookie-сессии |
+| GET | `/api/v1/policy` | Блокировка торрентов: `block_bittorrent` (выбор владельца, по умолчанию `true`), `supported` (движок главного сервера умеет блокировать), `applied`, счётчики `blocked_streams` и `blocked_datagrams` с запуска движка |
+| PUT | `/api/v1/policy` | CSRF. `{"block_bittorrent":bool}`: сохраняет выбор, сразу применяет на главном сервере, ноды получают его со следующей синхронизацией; аудит `policy.bittorrent_blocked` / `policy.bittorrent_allowed` |
 | GET | `/api/v1/auth/sessions` | Открытые сеансы панели: `id` (не значение cookie), `current`, `ip`, `agent`, `created_at`, `last_seen_at`, `expires_at`; `idle_minutes` |
 | POST | `/api/v1/auth/sessions/logout-others` | CSRF. Завершает все сеансы, кроме текущего; аудит `auth.sessions_revoked` |
 | POST | `/api/v1/auth/password` | JSON `current_password`, `new_password` (12–1024 байт) и CSRF. Сохраняет новый Argon2id-хеш в `config.json`, завершает остальные сессии, пишет `admin.password_changed` в аудит. До 5 попыток в минуту с IP |

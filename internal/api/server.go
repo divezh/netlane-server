@@ -387,6 +387,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		respond(w, 200, map[string]any{"domain": s.cfg.Domain, "stage": "managed-endpoint-preview", "endpoint_connected": err == nil, "capabilities": caps})
+	case r.URL.Path == "/api/v1/policy" && (r.Method == "GET" || r.Method == "PUT"):
+		s.policy(w, r)
 	case r.Method == "GET" && r.URL.Path == "/api/v1/endpoint/control":
 		state, err := s.control.Status(r.Context())
 		if err != nil {

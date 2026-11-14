@@ -1,0 +1,449 @@
+diff --git a/endpoint/src/management.rs b/endpoint/src/management.rs
+index 2f24a4c..a2bfa94 100644
+--- a/endpoint/src/management.rs
++++ b/endpoint/src/management.rs
+@@ -40,6 +40,16 @@ pub struct State {
+     pub usage_version: u32,
+     pub generation: u64,
+     pub users: Vec<ManagedUser>,
++    /// Netlane: BitTorrent blocking (trusttunnel::p2p_filter). On unless turned off; written only
++    /// when off, so a state file stays readable by endpoints that predate it.
++    #[serde(default = "yes", skip_serializing_if = "is_true")]
++    pub block_bittorrent: bool,
++}
++fn yes() -> bool {
++    true
++}
++fn is_true(on: &bool) -> bool {
++    *on
+ }
+ #[derive(Deserialize)]
+ #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+@@ -64,6 +74,9 @@ enum Request {
+     Disconnect {
+         username: String,
+     },
++    Policy {
++        block_bittorrent: bool,
++    },
+ }
+ pub struct Management {
+     state: Mutex<State>,
+@@ -145,6 +158,7 @@ impl State {
+                 version: 1,
+                 usage_version: 0,
+                 generation: 0,
++                block_bittorrent: true,
+                 users: clients
+                     .iter()
+                     .map(|c| ManagedUser {
+@@ -219,7 +233,7 @@ impl State {
+         std::fs::File::open(parent)?.sync_all()
+     }
+     fn public(&self) -> serde_json::Value {
+-        serde_json::json!({"version":1,"generation":self.generation,"capabilities":{"hot_reload":true,"disconnect_user":true,"remove_user":true,"speed_limits":true,"durable_quotas":true,"expiry":true},"users":self.users.iter().map(|u|serde_json::json!({"id":u.id,"username":u.username,"revision":u.revision,"enabled":u.enabled,"download_mbps":u.download_mbps,"upload_mbps":u.upload_mbps,"quota_bytes":u.quota_bytes,"expires_at":u.expires_at,"expired":expiry_millis(u.expires_at.as_deref()).ok().flatten().is_some_and(|at| chrono::Utc::now().timestamp_millis() >= at)})).collect::<Vec<_>>()})
++        serde_json::json!({"version":1,"generation":self.generation,"capabilities":{"hot_reload":true,"disconnect_user":true,"remove_user":true,"speed_limits":true,"durable_quotas":true,"expiry":true,"block_bittorrent":true},"policy":{"block_bittorrent":self.block_bittorrent,"blocked_streams":trusttunnel::p2p_filter::blocked().0,"blocked_datagrams":trusttunnel::p2p_filter::blocked().1},"users":self.users.iter().map(|u|serde_json::json!({"id":u.id,"username":u.username,"revision":u.revision,"enabled":u.enabled,"download_mbps":u.download_mbps,"upload_mbps":u.upload_mbps,"quota_bytes":u.quota_bytes,"expires_at":u.expires_at,"expired":expiry_millis(u.expires_at.as_deref()).ok().flatten().is_some_and(|at| chrono::Utc::now().timestamp_millis() >= at)})).collect::<Vec<_>>()})
+     }
+ }
+ impl Management {
+@@ -247,6 +261,7 @@ impl Management {
+         Ok(this)
+     }
+     fn apply(&self, state: &State) -> io::Result<()> {
++        trusttunnel::p2p_filter::set_enabled(state.block_bittorrent);
+         let clients = state.clients();
+         RegistryBasedAuthenticator::validate_clients(&clients)?;
+         self.core.traffic_control().replace(
+@@ -305,6 +320,16 @@ impl Management {
+                 }
+                 self.reply(&state)
+             }
++            Request::Policy { block_bittorrent } => {
++                let mut next = state.clone();
++                next.block_bittorrent = block_bittorrent;
++                if next.persist(&self.path).is_err() {
++                    return serde_json::json!({"ok":false,"error":"state_write_failed"});
++                }
++                trusttunnel::p2p_filter::set_enabled(block_bittorrent);
++                *state = next;
++                self.reply(&state)
++            }
+             Request::Disconnect { username } => {
+                 if !state.users.iter().any(|u| u.username == username) {
+                     return serde_json::json!({"ok":false,"error":"user_not_found"});
+@@ -547,6 +572,7 @@ mod tests {
+         let path = dir.path().join("state.json");
+         let mut state = State {
+             version: 1,
++            block_bittorrent: true,
+             usage_version: 1,
+             generation: 3,
+             users: vec![ManagedUser {
+@@ -597,6 +623,7 @@ mod tests {
+     fn largest_status_stays_within_rpc_response_bound() {
+         let state = State {
+             version: 1,
++            block_bittorrent: true,
+             usage_version: 1,
+             generation: u64::MAX,
+             users: (0..100)
+@@ -646,6 +673,7 @@ mod tests {
+         let path = dir.path().join("state.json");
+         let s = State {
+             version: 1,
++            block_bittorrent: true,
+             usage_version: 0,
+             generation: 3,
+             users: vec![ManagedUser {
+@@ -676,4 +704,22 @@ mod tests {
+         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+         assert!(State::load_or_import(&path, &[]).is_err());
+     }
++
++    #[test]
++    fn bittorrent_policy_is_written_only_when_off() {
++        let mut s: State =
++            serde_json::from_str(r#"{"version":1,"generation":0,"users":[]}"#).unwrap();
++        assert!(
++            s.block_bittorrent,
++            "blocking is on for state files that predate it"
++        );
++        assert!(!serde_json::to_string(&s)
++            .unwrap()
++            .contains("block_bittorrent"));
++        s.block_bittorrent = false;
++        let text = serde_json::to_string(&s).unwrap();
++        assert!(text.contains("\"block_bittorrent\":false"));
++        let back: State = serde_json::from_str(&text).unwrap();
++        assert!(!back.block_bittorrent);
++    }
+ }
+diff --git a/lib/src/lib.rs b/lib/src/lib.rs
+index 02e49f5..26b20f6 100644
+--- a/lib/src/lib.rs
++++ b/lib/src/lib.rs
+@@ -10,6 +10,7 @@ pub mod client_random_prefix;
+ pub mod core;
+ pub mod log_utils;
+ pub mod net_utils;
++pub mod p2p_filter;
+ pub mod rules;
+ pub mod settings;
+ pub mod shutdown;
+diff --git a/lib/src/p2p_filter.rs b/lib/src/p2p_filter.rs
+new file mode 100644
+index 0000000..2212afb
+--- /dev/null
++++ b/lib/src/p2p_filter.rs
+@@ -0,0 +1,165 @@
++//! BitTorrent blocking (Netlane). Tunneled traffic of VPN users is checked for the plain BitTorrent
++//! peer handshake, HTTP tracker announces, UDP tracker requests and DHT (KRPC) messages. A TCP stream
++//! that starts like that is closed; such a UDP datagram is dropped. Encrypted peer connections (MSE)
++//! cannot be told apart from other encrypted traffic and pass; without trackers and DHT they rarely
++//! find peers. The switch is global and set by the management socket (`policy`).
++
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++
++static ENABLED: AtomicBool = AtomicBool::new(true);
++static BLOCKED_STREAMS: AtomicU64 = AtomicU64::new(0);
++static BLOCKED_DATAGRAMS: AtomicU64 = AtomicU64::new(0);
++
++/// How many first bytes of a TCP stream are looked at, at most.
++pub const STREAM_WINDOW: usize = 2048;
++
++pub fn set_enabled(on: bool) {
++    ENABLED.store(on, Ordering::Relaxed);
++}
++
++pub fn enabled() -> bool {
++    ENABLED.load(Ordering::Relaxed)
++}
++
++/// (closed TCP streams, dropped UDP datagrams) since the endpoint started.
++pub fn blocked() -> (u64, u64) {
++    (
++        BLOCKED_STREAMS.load(Ordering::Relaxed),
++        BLOCKED_DATAGRAMS.load(Ordering::Relaxed),
++    )
++}
++
++pub(crate) fn count_stream() {
++    BLOCKED_STREAMS.fetch_add(1, Ordering::Relaxed);
++}
++
++pub(crate) fn count_datagram() {
++    BLOCKED_DATAGRAMS.fetch_add(1, Ordering::Relaxed);
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub(crate) enum Verdict {
++    BitTorrent,
++    Other,
++    NeedMore,
++}
++
++const HANDSHAKE: &[u8] = b"\x13BitTorrent protocol";
++
++/// Looks at the first bytes a client sends on a TCP stream.
++pub(crate) fn inspect_stream(prefix: &[u8]) -> Verdict {
++    if prefix.is_empty() {
++        return Verdict::NeedMore;
++    }
++    // Peer wire protocol: <19>"BitTorrent protocol".
++    if prefix[0] == HANDSHAKE[0] {
++        let n = prefix.len().min(HANDSHAKE.len());
++        if prefix[..n] != HANDSHAKE[..n] {
++            return Verdict::Other;
++        }
++        return if n == HANDSHAKE.len() {
++            Verdict::BitTorrent
++        } else {
++            Verdict::NeedMore
++        };
++    }
++    // HTTP tracker: GET /announce?info_hash=… or /scrape?info_hash=…
++    const GET: &[u8] = b"GET ";
++    let n = prefix.len().min(GET.len());
++    if prefix[..n] != GET[..n] {
++        return Verdict::Other;
++    }
++    let line_end = prefix.windows(2).position(|w| w == b"\r\n");
++    let line = match line_end {
++        Some(end) => &prefix[..end],
++        None if prefix.len() < STREAM_WINDOW => return Verdict::NeedMore,
++        None => prefix,
++    };
++    let lower: Vec<u8> = line.iter().map(u8::to_ascii_lowercase).collect();
++    let has = |needle: &[u8]| lower.windows(needle.len()).any(|w| w == needle);
++    if has(b"info_hash=") && (has(b"announce") || has(b"scrape")) {
++        Verdict::BitTorrent
++    } else {
++        Verdict::Other
++    }
++}
++
++/// UDP tracker protocol (BEP 15): connect request with the magic protocol id.
++const UDP_TRACKER_MAGIC: [u8; 8] = [0x00, 0x00, 0x04, 0x17, 0x27, 0x10, 0x19, 0x80];
++
++/// True for a datagram of the BitTorrent DHT or a UDP tracker request.
++pub(crate) fn inspect_datagram(payload: &[u8]) -> bool {
++    if payload.len() >= 16 && payload[..8] == UDP_TRACKER_MAGIC && payload[8..12] == [0, 0, 0, 0] {
++        return true;
++    }
++    // KRPC (BEP 5) is a bencoded dictionary with a message type and a 20-byte node id:
++    // d1:ad2:id20:…e1:q4:ping1:t2:aa1:y1:qe
++    if payload.len() >= 20
++        && payload.len() <= 2048
++        && payload[0] == b'd'
++        && payload.last() == Some(&b'e')
++    {
++        let has = |needle: &[u8]| payload.windows(needle.len()).any(|w| w == needle);
++        return has(b"1:y1:") && has(b"2:id20:");
++    }
++    false
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn peer_handshake() {
++        let mut hello = HANDSHAKE.to_vec();
++        hello.extend_from_slice(&[0; 8]);
++        assert_eq!(inspect_stream(&hello), Verdict::BitTorrent);
++        assert_eq!(inspect_stream(&HANDSHAKE[..5]), Verdict::NeedMore);
++        assert_eq!(inspect_stream(b"\x13Some other protocol"), Verdict::Other);
++    }
++
++    #[test]
++    fn http_tracker() {
++        assert_eq!(
++            inspect_stream(b"GET /announce?info_hash=%12%34&peer_id=-qB4650-&port=6881 HTTP/1.1\r\nHost: t.example\r\n\r\n"),
++            Verdict::BitTorrent
++        );
++        assert_eq!(
++            inspect_stream(b"GET /scrape.php?INFO_HASH=abc HTTP/1.0\r\n"),
++            Verdict::BitTorrent
++        );
++        assert_eq!(inspect_stream(b"GET /announce?info_ha"), Verdict::NeedMore);
++        assert_eq!(
++            inspect_stream(b"GET /news/announce HTTP/1.1\r\nHost: example.com\r\n\r\n"),
++            Verdict::Other
++        );
++        assert_eq!(
++            inspect_stream(b"POST /announce?info_hash=1"),
++            Verdict::Other
++        );
++        assert_eq!(inspect_stream(b"\x16\x03\x01\x02\x00"), Verdict::Other);
++        assert_eq!(inspect_stream(b"SSH-2.0-OpenSSH_9.6"), Verdict::Other);
++    }
++
++    #[test]
++    fn dht_and_udp_tracker() {
++        assert!(inspect_datagram(
++            b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe"
++        ));
++        assert!(inspect_datagram(
++            b"d1:rd2:id20:mnopqrstuvwxyz123456e1:t2:aa1:y1:re"
++        ));
++        let mut connect = UDP_TRACKER_MAGIC.to_vec();
++        connect.extend_from_slice(&[0, 0, 0, 0, 1, 2, 3, 4]);
++        assert!(inspect_datagram(&connect));
++        // DNS, QUIC and plain bencode-looking text are not blocked.
++        assert!(!inspect_datagram(&[
++            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 7, b'e', b'x', b'a', b'm', b'p',
++            b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1
++        ]));
++        assert!(!inspect_datagram(&[
++            0xc3, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0x44, 0xd0, 1, 2, 3, 4, 5
++        ]));
++        assert!(!inspect_datagram(b"d4:name5:hello4:size3:abce"));
++    }
++}
+diff --git a/lib/src/pipe.rs b/lib/src/pipe.rs
+index e562e0e..e5ea134 100644
+--- a/lib/src/pipe.rs
++++ b/lib/src/pipe.rs
+@@ -93,6 +93,8 @@ pub(crate) struct SimplexPipe<F> {
+     direction: SimplexDirection,
+     last_activity: Instant,
+     control: Option<std::sync::Arc<crate::traffic_control::UserControl>>,
++    /// First bytes of a user's stream while it is checked for BitTorrent (crate::p2p_filter).
++    p2p: Option<Vec<u8>>,
+ }
+ 
+ pub(crate) struct Error<T> {
+@@ -138,6 +140,7 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
+             direction,
+             last_activity: Instant::now(),
+             control: None,
++            p2p: None,
+         }
+     }
+ 
+@@ -149,6 +152,7 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
+     ) -> Result<ExchangeOnceStatus<T>, Error<T>> {
+         loop {
+             self.last_activity = Instant::now();
++            let from_source = self.pending_chunk.is_none();
+ 
+             let future = async {
+                 self.sink.flush().await?;
+@@ -181,6 +185,38 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
+ 
+             match data {
+                 Data::Chunk(bytes) => {
++                    if from_source {
++                        if let Some(prefix) = self.p2p.as_mut() {
++                            let take = bytes
++                                .len()
++                                .min(crate::p2p_filter::STREAM_WINDOW - prefix.len());
++                            prefix.extend_from_slice(&bytes[..take]);
++                            match crate::p2p_filter::inspect_stream(prefix) {
++                                crate::p2p_filter::Verdict::BitTorrent => {
++                                    crate::p2p_filter::count_stream();
++                                    log_dir!(
++                                        debug,
++                                        self.source.id(),
++                                        self.direction,
++                                        "BitTorrent stream blocked"
++                                    );
++                                    return Err(io_to_pipe_error(
++                                        id,
++                                        io::Error::new(
++                                            ErrorKind::PermissionDenied,
++                                            "BitTorrent is blocked on this server",
++                                        ),
++                                    ));
++                                }
++                                crate::p2p_filter::Verdict::Other => self.p2p = None,
++                                crate::p2p_filter::Verdict::NeedMore => {
++                                    if prefix.len() >= crate::p2p_filter::STREAM_WINDOW {
++                                        self.p2p = None;
++                                    }
++                                }
++                            }
++                        }
++                    }
+                     let data_len = bytes.len();
+                     let permit = if let Some(control) = &self.control {
+                         let n = data_len.min(16384);
+@@ -248,6 +284,17 @@ impl<F: Fn(SimplexDirection, usize) + Send + Clone> DuplexPipe<F> {
+         self.right_pipe.control = control;
+         self
+     }
++    /// Checks what the client sends first for BitTorrent when blocking is on (crate::p2p_filter).
++    pub(crate) fn with_p2p_filter(mut self) -> Self {
++        if crate::p2p_filter::enabled() {
++            for pipe in [&mut self.left_pipe, &mut self.right_pipe] {
++                if pipe.direction == SimplexDirection::Outgoing {
++                    pipe.p2p = Some(Vec::new());
++                }
++            }
++        }
++        self
++    }
+     pub fn new(
+         (dir1, source1, sink1): (SimplexDirection, Box<dyn Source>, Box<dyn Sink>),
+         (dir2, source2, sink2): (SimplexDirection, Box<dyn Source>, Box<dyn Sink>),
+@@ -393,4 +440,26 @@ mod managed_tests {
+         assert_eq!(consumed.load(Ordering::Relaxed), 65536);
+         assert_eq!(Instant::now(), start);
+     }
++
++    #[tokio::test]
++    async fn bittorrent_handshake_closes_the_stream() {
++        crate::p2p_filter::set_enabled(true);
++        let mut hello = b"\x13BitTorrent protocol".to_vec();
++        hello.extend_from_slice(&[0; 48]);
++        let mut pipe = SimplexPipe::new(
++            Box::new(OneChunk {
++                chunk: Some(Bytes::from(hello)),
++                consumed: Arc::new(AtomicUsize::new(0)),
++            }),
++            Box::new(PartialSink),
++            |_, _| {},
++            SimplexDirection::Outgoing,
++        );
++        pipe.p2p = Some(Vec::new());
++        let error = match pipe.exchange((), Duration::from_secs(30)).await {
++            Err(e) => e.io,
++            Ok(_) => panic!("a BitTorrent handshake must not pass"),
++        };
++        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
++    }
+ }
+diff --git a/lib/src/tunnel.rs b/lib/src/tunnel.rs
+index 213db12..abcac30 100644
+--- a/lib/src/tunnel.rs
++++ b/lib/src/tunnel.rs
+@@ -496,7 +496,8 @@ impl Tunnel {
+             (pipe::SimplexDirection::Incoming, fwd_rx, dstr_tx),
+             update_metrics,
+         )
+-        .with_control(control);
++        .with_control(control)
++        .with_p2p_filter();
+ 
+         log_id!(trace, request_id, "TCP connect: pipe exchange started");
+         match pipe
+diff --git a/lib/src/udp_pipe.rs b/lib/src/udp_pipe.rs
+index 81835b5..ab95dd1 100644
+--- a/lib/src/udp_pipe.rs
++++ b/lib/src/udp_pipe.rs
+@@ -61,6 +61,14 @@ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> LeftPipe<F> {
+             let datagram = self.source.read().await?;
+             log_id!(trace, self.source.id(), "--> Datagram: {:?}", datagram);
+ 
++            if crate::p2p_filter::enabled()
++                && crate::p2p_filter::inspect_datagram(&datagram.payload)
++            {
++                crate::p2p_filter::count_datagram();
++                log_id!(debug, self.source.id(), "--> BitTorrent datagram dropped");
++                continue;
++            }
++
+             if let Err(e) = self.on_udp_packet(&datagram.meta).await {
+                 log_id!(
+                     debug,

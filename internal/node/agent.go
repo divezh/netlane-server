@@ -24,6 +24,7 @@ type ControlAPI interface {
 	Remove(ctx context.Context, generation uint64, id, username string, revision int64) (endpoint.ControlState, error)
 	Disconnect(ctx context.Context, username string) (int, error)
 	Usage(ctx context.Context, month, after string) (*endpoint.UsageReport, error)
+	SyncBlockBitTorrent(ctx context.Context, on bool) (bool, error)
 }
 
 // Agent keeps the local endpoint's users equal to main's snapshot.
@@ -51,6 +52,8 @@ type syncReply struct {
 	Unchanged bool                    `json:"unchanged"`
 	Users     []store.DistributedUser `json:"users"`
 	Commands  []store.Command         `json:"commands"`
+	// BlockBitTorrent is the owner's BitTorrent choice; nil from a main server that predates it.
+	BlockBitTorrent *bool `json:"block_bittorrent"`
 }
 
 var errRevoked = errors.New("node token revoked")
@@ -144,6 +147,11 @@ func (a *Agent) Run(ctx context.Context) error {
 			wait, backoff = backoff, min(backoff*2, maxBackoff)
 		default:
 			backoff = firstBackoff
+			if reply.BlockBitTorrent != nil && a.Control != nil {
+				if _, err := a.Control.SyncBlockBitTorrent(ctx, *reply.BlockBitTorrent); err != nil {
+					a.logf("node: не удалось применить блокировку торрентов: %v", err)
+				}
+			}
 			if reply.Unchanged {
 				if !a.polling {
 					noteShort(started)

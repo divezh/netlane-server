@@ -148,7 +148,7 @@ func (h *syncHandler) sync(w http.ResponseWriter, r *http.Request) {
 	}
 	if !h.pending(r.Context(), node.ID, report.Revision) && (wait == 0 || !h.hub.Wait(r.Context(), ticket, wait)) {
 		if revision, err := h.db.UsersRevision(r.Context()); err == nil && revision == report.Revision {
-			respond(w, 200, map[string]any{"revision": revision, "unchanged": true})
+			respond(w, 200, map[string]any{"revision": revision, "unchanged": true, "block_bittorrent": h.blockBitTorrent(r.Context())})
 			return
 		}
 	}
@@ -172,7 +172,7 @@ func (h *syncHandler) sync(w http.ResponseWriter, r *http.Request) {
 		problem(w, 500, "storage_error")
 		return
 	}
-	respond(w, 200, map[string]any{"revision": revision, "users": users, "commands": commands})
+	respond(w, 200, map[string]any{"revision": revision, "users": users, "commands": commands, "block_bittorrent": h.blockBitTorrent(r.Context())})
 }
 
 // pending reports whether the node is behind or has commands to run.
@@ -314,4 +314,14 @@ func usable(u store.DistributedUser, now time.Time) bool {
 		}
 	}
 	return true
+}
+
+// blockBitTorrent is the owner's BitTorrent choice for the node; nil (the node keeps its own) when
+// the panel database cannot say.
+func (h *syncHandler) blockBitTorrent(ctx context.Context) *bool {
+	on, err := h.db.BlockBitTorrent(ctx)
+	if err != nil {
+		return nil
+	}
+	return &on
 }

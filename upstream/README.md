@@ -29,6 +29,7 @@ git -C research/upstream apply ../../upstream/patches/0003-managed-expiry.patch
 git -C research/upstream apply ../../upstream/patches/0004-durable-monthly-quota.patch
 git -C research/upstream apply ../../upstream/patches/0005-remove-managed-users.patch
 git -C research/upstream apply ../../upstream/patches/0006-dependency-security-updates.patch
+git -C research/upstream apply ../../upstream/patches/0007-block-bittorrent.patch
 docker build -t tt-upstream-test -f deploy/ci/upstream.Dockerfile deploy/ci
 docker run --rm -v "$PWD/research/upstream:/src" tt-upstream-test \
   bash -c 'cargo test --locked -p trusttunnel --lib && cargo test --locked -p trusttunnel --test managed && cargo test --locked -p trusttunnel_endpoint --bin trusttunnel_endpoint'
@@ -39,3 +40,5 @@ docker run --rm -v "$PWD/research/upstream:/src" tt-upstream-test \
 Патч `0005-remove-managed-users.patch` добавляет capability `remove_user` и версионированную команду удаления. Сессии и credentials отзываются после сохранения managed state; журнал расхода сохраняется. Повтор по отсутствующему ID не удаляет нового пользователя с тем же именем.
 
 Патч `0006-dependency-security-updates.patch` меняет `Cargo.lock` и одну строку `lib/src/icmp_forwarder.rs` (`AsyncFd::register` вместо устаревшего небезопасного `AsyncFd::new`, RUSTSEC-2026-0386): h2 0.4.20, rustls 0.23.46, rustls-webpki 0.103.17, webpki-roots 1.0.12, tokio 1.54.1, rustix 1.1.6, quinn-proto 0.11.19, quinn-udp 0.5.16 — исправления известных уязвимостей (RustSec). Остаётся h2 0.3.27 (прямая зависимость upstream, исправления для ветки 0.3 нет; уязвимость низкой важности) — CI проверяет остальное `cargo audit`.
+
+Патч `0007-block-bittorrent.patch` добавляет блокировку BitTorrent (`lib/src/p2p_filter.rs`): TCP-поток пользователя, который начинается с рукопожатия BitTorrent или HTTP-анонса трекеру (`GET …announce?info_hash=`), закрывается; UDP-датаграммы DHT (KRPC) и UDP-трекеров отбрасываются. Переключатель — команда `{"op":"policy","block_bittorrent":bool}` управляющего сокета; значение хранится в состоянии endpoint (поле пишется, только когда блокировка выключена) и видно в `status` как `policy` со счётчиками `blocked_streams` и `blocked_datagrams`.
