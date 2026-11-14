@@ -1,7 +1,16 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 9ae38ca..6694ca7 100644
+index 9ae38ca..e4e8a29 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
+@@ -741,7 +741,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
+ dependencies = [
+  "libc",
+- "windows-sys 0.61.2",
++ "windows-sys 0.59.0",
+ ]
+ 
+ [[package]]
 @@ -984,9 +984,9 @@ dependencies = [
  
  [[package]]
@@ -23,6 +32,24 @@ index 9ae38ca..6694ca7 100644
   "http 1.5.0",
   "http-body 1.1.0",
   "httparse",
+@@ -1208,7 +1208,7 @@ dependencies = [
+  "libc",
+  "percent-encoding",
+  "pin-project-lite",
+- "socket2 0.6.5",
++ "socket2 0.5.10",
+  "tokio",
+  "tower-service",
+  "tracing",
+@@ -2263,7 +2263,7 @@ dependencies = [
+  "quinn-udp",
+  "rustc-hash",
+  "rustls",
+- "socket2 0.6.5",
++ "socket2 0.5.10",
+  "thiserror 2.0.20",
+  "tokio",
+  "tracing",
 @@ -2272,9 +2272,9 @@ dependencies = [
  
  [[package]]
@@ -35,7 +62,7 @@ index 9ae38ca..6694ca7 100644
  dependencies = [
   "bytes",
   "getrandom 0.4.3",
-@@ -2294,9 +2294,9 @@ dependencies = [
+@@ -2294,16 +2294,16 @@ dependencies = [
  
  [[package]]
  name = "quinn-udp"
@@ -47,7 +74,16 @@ index 9ae38ca..6694ca7 100644
  dependencies = [
   "cfg_aliases 0.2.2",
   "libc",
-@@ -2571,9 +2571,9 @@ dependencies = [
+  "once_cell",
+- "socket2 0.6.5",
++ "socket2 0.5.10",
+  "tracing",
+- "windows-sys 0.61.2",
++ "windows-sys 0.59.0",
+ ]
+ 
+ [[package]]
+@@ -2571,22 +2571,22 @@ dependencies = [
  
  [[package]]
  name = "rustix"
@@ -59,7 +95,11 @@ index 9ae38ca..6694ca7 100644
  dependencies = [
   "bitflags 2.13.1",
   "errno",
-@@ -2584,9 +2584,9 @@ dependencies = [
+  "libc",
+  "linux-raw-sys 0.12.1",
+- "windows-sys 0.61.2",
++ "windows-sys 0.59.0",
+ ]
  
  [[package]]
  name = "rustls"
@@ -83,7 +123,7 @@ index 9ae38ca..6694ca7 100644
  dependencies = [
   "aws-lc-rs",
   "ring",
-@@ -3108,9 +3108,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+@@ -3108,10 +3108,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
  checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
  dependencies = [
   "fastrand",
@@ -91,10 +131,12 @@ index 9ae38ca..6694ca7 100644
 + "getrandom 0.3.4",
   "once_cell",
 - "rustix 1.1.4",
+- "windows-sys 0.61.2",
 + "rustix 1.1.6",
-  "windows-sys 0.61.2",
++ "windows-sys 0.59.0",
  ]
  
+ [[package]]
 @@ -3234,9 +3234,9 @@ dependencies = [
  
  [[package]]
@@ -119,3 +161,19 @@ index 9ae38ca..6694ca7 100644
  dependencies = [
   "rustls-pki-types",
  ]
+diff --git a/lib/src/icmp_forwarder.rs b/lib/src/icmp_forwarder.rs
+index 14183dd..6fabb7c 100644
+--- a/lib/src/icmp_forwarder.rs
++++ b/lib/src/icmp_forwarder.rs
+@@ -428,8 +428,10 @@ impl RawPacketStream {
+                 return Err(io::Error::last_os_error());
+             }
+ 
+-            let socket = AsyncFd::new(fd).inspect_err(|_| {
++            // `fd` was just opened here and is owned by this AsyncFd until it is dropped.
++            let socket = AsyncFd::register(fd).map_err(|e| {
+                 libc::close(fd);
++                e.into_parts().1
+             })?;
+ 
+             Ok(Self { inner: socket })
