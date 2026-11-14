@@ -47,7 +47,7 @@ function trafficChart() {
   const line = key => history.map((report,i) => `${x(i)},${y(report.totals[key])}`).join(' ');
   const options = usage?.months.map(month => `<option value="${escapeHTML(month)}"${month===usage.month?' selected':''}>${escapeHTML(month)}</option>`).join('');
   const graph = history.length ? `<svg viewBox="0 0 620 222" role="img" aria-label="Загрузка и отдача по месяцам UTC">
-    ${[0,1,2,3].map(i => `<line x1="74" x2="602" y1="${y(max*i/3)}" y2="${y(max*i/3)}" class="chart-grid"/><text x="0" y="${y(max*i/3)+4}">${bytes(max*i/3)}</text>`).join('')}
+    ${[0,1,2,3].map(i => `<line x1="74" x2="602" y1="${y(max*i/3)}" y2="${y(max*i/3)}" class="chart-grid"/><text class="chart-value" x="0" y="${y(max*i/3)+4}">${bytes(max*i/3)}</text>`).join('')}
     ${history.length>1 ? `<polygon class="chart-area" points="74,182 ${line('download_bytes')} 602,182"/>` : ''}
     ${['download_bytes','upload_bytes'].map(key => `<g class="${key}"><polyline points="${line(key)}"/>${history.map((report,i) => `<circle cx="${x(i)}" cy="${y(report.totals[key])}" r="3.5"><title>${escapeHTML(report.month)} · ${bytes(report.totals[key])}</title></circle>`).join('')}</g>`).join('')}
     ${history.map((report,i) => `<text x="${x(i)}" y="208" text-anchor="${history.length===1?'middle':i===0?'start':i===history.length-1?'end':'middle'}">${escapeHTML(report.month)}</text>`).join('')}</svg>
@@ -139,7 +139,7 @@ function liveTrafficChart(){
   return `<section class="panel traffic-chart"><div class="panel-head"><h2>Трафик сейчас</h2><span class="hint">Главный сервер · 15 с</span></div>
     <div class="live-rates"><span>↓ Загрузка <strong>${rateText(liveTraffic.current?.download)}</strong></span><span>↑ Отдача <strong>${rateText(liveTraffic.current?.upload)}</strong></span></div>
     ${valid.length?`<svg viewBox="0 0 620 222" role="img" aria-label="Скорость VPN по текущим замерам">
-      ${[0,1,2,3].map(i=>`<line x1="74" x2="602" y1="${y(max*i/3)}" y2="${y(max*i/3)}" class="chart-grid"/><text x="0" y="${y(max*i/3)+4}">${rateText(max*i/3)}</text>`).join('')}
+      ${[0,1,2,3].map(i=>`<line x1="74" x2="602" y1="${y(max*i/3)}" y2="${y(max*i/3)}" class="chart-grid"/><text class="chart-value" x="0" y="${y(max*i/3)+4}">${rateText(max*i/3)}</text>`).join('')}
       ${series('download')}${series('upload')}<text x="74" y="208">${time(first)}</text><text x="602" y="208" text-anchor="end">${time(last)}</text></svg>`:
       `<p class="empty">${state.metrics?'Собираем замеры. Скорость появится после следующего обновления.':'Метрики недоступны. Ожидаем соединения с сервером.'}</p>`}
     <div class="chart-legend"><span>Загрузка</span><span>Отдача</span></div><p class="hint">Средняя скорость между замерами. История до 15 минут собирается, пока открыта панель. После пропуска или сброса счётчиков нужен новый замер.</p></section>`;
@@ -195,6 +195,9 @@ function statisticsChart(points,key,{percent=false,bars=false,second=null}={}){
   // Столбец плотной истории — диапазон: подпись показывает его границы, а не одну минуту.
   const clock=at=>new Date(at*1000).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'});
   const span=p=>p.from==null?stamp(p.at):`${clock(p.from)} – ${clock(p.to)}`;
+  // Axis labels as short as the period allows: time within a day, date and time within a week, else the date.
+  const day=at=>new Date(at*1000).toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit'});
+  const tickText=at=>last-first<=86400?clock(at):last-first<=7*86400?`${day(at)} ${clock(at)}`:day(at);
   const name=chartNames[key]||key;
   const step=points.length>1?528/(points.length-1):528;
   // За длинные периоды точек сотни: столбец уже шага становился долей пикселя, два цвета сливались в муар.
@@ -225,11 +228,11 @@ function statisticsChart(points,key,{percent=false,bars=false,second=null}={}){
   const ticks=first===last?[points[0]]:[0,.33,.66,1].map(f=>points[Math.round(f*(points.length-1))]);
   return `<svg viewBox="0 0 620 222" role="img" aria-label="${bars?'Потребление':'История'}: ${escapeHTML(name)}${second?` и ${escapeHTML(chartNames[second]||second)}`:''}">
     <rect class="chart-surface" x="74" y="40" width="528" height="142"/>
-    ${(percent?[0,.25,.5,.75,1]:[0,1/3,2/3,1]).map(i=>`<line x1="74" x2="602" y1="${y(max*i)}" y2="${y(max*i)}" class="chart-grid"/><text x="0" y="${y(max*i)+4}">${escapeHTML(label(max*i))}</text>`).join('')}
+    ${(percent?[0,.25,.5,.75,1]:[0,1/3,2/3,1]).map(i=>`<line x1="74" x2="602" y1="${y(max*i)}" y2="${y(max*i)}" class="chart-grid"/><text class="chart-value" x="0" y="${y(max*i)+4}">${escapeHTML(label(max*i))}</text>`).join('')}
     ${columns}
     ${hits}
     <line class="chart-cursor" x1="0" x2="0" y1="40" y2="182" data-css="display:none"/>
-    ${ticks.map((p,i)=>`<text x="${x(p)}" y="211" text-anchor="${i===0?'start':(i===ticks.length-1?'end':'middle')}">${stamp(p.at)}</text>`).join('')}</svg>
+    ${ticks.map((p,i)=>`<text class="chart-tick" x="${x(p)}" y="211" text-anchor="${i===0?'start':(i===ticks.length-1?'end':'middle')}">${tickText(p.at)}</text>`).join('')}</svg>
     ${clipped?`<span class="chart-badge">пик ${escapeHTML(bytes(rawMax))} · выше шкалы</span>`:''}`;
 }
 function clientStatistics(report){
@@ -498,18 +501,35 @@ function refreshView(){
 }
 function fitTrafficCharts(){
   for(const svg of document.querySelectorAll('.traffic-chart svg')){
-    const width=svg.clientWidth;
-    if(width<120)continue;
-    const x=value=>80+(Number(value)-74)*(width-98)/528;
+    const shown=svg.clientWidth,tall=svg.clientHeight||222;
+    if(shown<120)continue;
+    // The drawing is 222 units high; a shorter box (190 px in «Ресурсы сервера») would scale the whole
+    // picture down and leave empty sides, so the width in drawing units follows the box's proportions.
+    const width=shown*222/tall;
+    // The plot starts right after the widest value label instead of a fixed 80 units.
+    const labels=[...svg.querySelectorAll('text.chart-value')];
+    let widest=0;for(const t of labels){try{widest=Math.max(widest,t.getComputedTextLength());}catch(e){}}
+    const left=Math.max(34,Math.ceil(widest)+10),right=12,plot=width-left-right;
+    const x=value=>left+(Number(value)-74)*plot/528;
     svg.setAttribute('viewBox',`0 0 ${width} 222`);
     for(const node of svg.querySelectorAll('[x],[x1],[x2],[cx],[points],[width]')){
+      if(node.classList.contains('chart-value'))continue;
       if(!node.chartGeometry)node.chartGeometry=Object.fromEntries(['x','x1','x2','cx','points','width'].filter(a=>node.hasAttribute(a)).map(a=>[a,node.getAttribute(a)]));
       for(const [key,value] of Object.entries(node.chartGeometry)){
         if(key==='points')node.setAttribute(key,value.split(' ').map(point=>{const [px,py]=point.split(',');return `${x(px)},${py}`;}).join(' '));
-        else if(key==='width')node.setAttribute(key,String(Number(value)*(width-98)/528));
+        else if(key==='width')node.setAttribute(key,String(Number(value)*plot/528));
         else node.setAttribute(key,Number(value)===0?'0':String(x(value)));
       }
     }
+    // Time labels never overlap: the first and the last stay, a middle one shows only where it fits.
+    const ticks=[...svg.querySelectorAll('text.chart-tick')];
+    const box=t=>{let w=0;try{w=t.getComputedTextLength();}catch(e){}const at=Number(t.getAttribute('x')),a=t.getAttribute('text-anchor');return a==='start'?[at,at+w]:a==='end'?[at-w,at]:[at-w/2,at+w/2];};
+    for(const t of ticks)t.removeAttribute('visibility');
+    if(ticks.length>2){
+      const lastBox=box(ticks.at(-1));let previous=box(ticks[0]);
+      for(const t of ticks.slice(1,-1)){const b=box(t);if(b[0]<previous[1]+12||b[1]>lastBox[0]-12)t.setAttribute('visibility','hidden');else previous=b;}
+    }
+    if(ticks.length>1){const a=box(ticks[0]),b=box(ticks.at(-1));if(a[1]+8>b[0])ticks.at(-1).setAttribute('visibility','hidden');}
   }
 }
 new ResizeObserver(fitTrafficCharts).observe($('content'));
