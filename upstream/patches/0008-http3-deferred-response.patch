@@ -1,0 +1,751 @@
+diff --git a/AGENTS.md b/AGENTS.md
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -179,6 +179,8 @@
+ 
+ ### II. Code Quality Standards
+ 
++- Preserve pending HTTP/3 response headers until delivery or stream reset; never send DATA or FIN first.
++
+ 1. Follow `rustfmt` defaults. Validate with `make lint-rust`.
+ 
+    **Rationale**: consistent formatting across the workspace.
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,9 @@
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+ 
+ ## [Unreleased]
++
++- [Fix] HTTP/3 retains deferred response headers through sink teardown and UDP
++  inactivity, sends HEADERS before DATA/FIN, and waits for capacity growth before retrying.
+ 
+ - [Feature] Managed `remove` revokes sessions and credentials durably by user ID
+   with generation/revision checks while preserving monthly usage history.
+diff --git a/endpoint/src/main.rs b/endpoint/src/main.rs
+--- a/endpoint/src/main.rs
++++ b/endpoint/src/main.rs
+@@ -15,7 +15,7 @@
+ use trusttunnel::{log_utils, settings};
+ mod management;
+ 
+-const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.5");
++const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.5-quic.1");
+ const VERSION_PARAM_NAME: &str = "v_e_r_s_i_o_n_do_not_change_this_name_it_will_break";
+ const LOG_LEVEL_PARAM_NAME: &str = "log_level";
+ const LOG_FILE_PARAM_NAME: &str = "log_file";
+diff --git a/lib/src/http3_codec.rs b/lib/src/http3_codec.rs
+--- a/lib/src/http3_codec.rs
++++ b/lib/src/http3_codec.rs
+@@ -11,6 +11,8 @@
+ use std::sync::Arc;
+ use tokio::sync::mpsc;
+ 
++type PendingResponse = Arc<std::sync::Mutex<Option<(ResponseHeaders, bool)>>>;
++
+ pub(crate) struct Http3Codec {
+     socket: Arc<QuicSocket>,
+     streams: HashMap<u64, Stream>,
+@@ -25,6 +27,8 @@
+     WaitingWritable(/* stream ID */ u64),
+     /// stream ID, shutdown direction (`None` means both directions)
+     Shutdown(u64, Option<quiche::Shutdown>),
++    /// The codec retries headers even if the sink is dropped or has no more datagrams.
++    DeferredResponse(u64, PendingResponse),
+ }
+ 
+ struct Stream {
+@@ -34,6 +38,8 @@
+     writable_event_tx: mpsc::Sender<()>,
+     read_shutdown: bool,
+     write_shutdown: bool,
++    /// A FIN must never precede these headers.
++    deferred_response: Option<PendingResponse>,
+ }
+ 
+ struct DetachedStream {
+@@ -64,10 +70,8 @@
+     /// (see [`StreamSink::wait_writable()`]) to avoid busy loops.
+     data_frame_overhead: usize,
+     id: log_utils::IdChain<u64>,
+-    /// Unsent response headers stored when `send_response()` encounters
+-    /// `StreamBlocked`. Consumed on the first `wait_writable()` cycle.
+-    /// The second boolean parameter represents EOF.
+-    pending_response: Option<(ResponseHeaders, bool)>,
++    /// Shared with the codec until HEADERS (and optionally FIN) have been sent.
++    pending_response: PendingResponse,
+ }
+ 
+ impl Http3Codec {
+@@ -92,6 +96,51 @@
+             StreamMessage::Shutdown(stream_id, direction) => {
+                 self.on_stream_shutdown(stream_id, direction)
+             }
++            StreamMessage::DeferredResponse(stream_id, response) => {
++                if let Some(stream) = self.streams.get_mut(&stream_id) {
++                    stream.deferred_response = Some(response);
++                }
++                self.flush_deferred_response(stream_id)
++            }
++        }
++    }
++
++    /// Retry HEADERS without depending on another write from the sink.
++    fn flush_deferred_response(&mut self, stream_id: u64) -> io::Result<()> {
++        let Some(stream) = self.streams.get_mut(&stream_id) else {
++            return Ok(());
++        };
++        let Some(pending) = stream.deferred_response.clone() else {
++            return Ok(());
++        };
++        let mut response = pending.lock().unwrap();
++        let Some((headers, eof)) = response.as_ref() else {
++            stream.deferred_response = None;
++            return Ok(());
++        };
++        let eof = *eof;
++        match self.socket.send_response(stream_id, headers, eof) {
++            Ok(()) => {
++                *response = None;
++                stream.deferred_response = None;
++                stream.write_shutdown = eof;
++                if !eof {
++                    let _ = stream.writable_event_tx.try_send(());
++                }
++                if stream.read_shutdown && stream.write_shutdown {
++                    self.streams.remove(&stream_id);
++                }
++                Ok(())
++            }
++            Err(e) if e.kind() == ErrorKind::WouldBlock => {
++                self.socket.notify_stream_waiting_writable(stream_id);
++                Ok(())
++            }
++            Err(e) => {
++                self.socket.reset_stream(stream_id);
++                self.streams.remove(&stream_id);
++                Err(e)
++            }
+         }
+     }
+ 
+@@ -100,10 +149,9 @@
+         stream_id: u64,
+         direction: Option<quiche::Shutdown>,
+     ) -> io::Result<()> {
+-        let stream = self
+-            .streams
+-            .get_mut(&stream_id)
+-            .ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
++        let Some(stream) = self.streams.get_mut(&stream_id) else {
++            return Ok(());
++        };
+ 
+         let (close_read, close_write) = match direction {
+             Some(quiche::Shutdown::Read) => (true, false),
+@@ -111,12 +159,26 @@
+             None => (true, true),
+         };
+ 
++        if close_write {
++            let mut pending_empty = false;
++            if let Some(response) = stream.deferred_response.as_ref() {
++                match response.lock().unwrap().as_mut() {
++                    Some((_, eof)) => *eof = true,
++                    None => pending_empty = true,
++                }
++            }
++            if pending_empty {
++                stream.deferred_response = None;
++            }
++        }
++
+         if close_read && !stream.read_shutdown {
+             self.socket
+                 .shutdown_stream(stream_id, quiche::Shutdown::Read);
+             stream.read_shutdown = true;
+         }
+-        if close_write && !stream.write_shutdown {
++        // With deferred response headers the FIN goes out together with them.
++        if close_write && !stream.write_shutdown && stream.deferred_response.is_none() {
+             self.socket
+                 .shutdown_stream(stream_id, quiche::Shutdown::Write);
+             stream.write_shutdown = true;
+@@ -172,6 +234,7 @@
+                 writable_event_tx: writable_tx,
+                 read_shutdown: false,
+                 write_shutdown: false,
++                deferred_response: None,
+             },
+         );
+ 
+@@ -191,7 +254,7 @@
+                 codec_tx: self.codec_tx.clone(),
+                 data_frame_overhead: net_utils::MIN_USABLE_QUIC_STREAM_CAPACITY,
+                 id,
+-                pending_response: None,
++                pending_response: Default::default(),
+             },
+         }))
+     }
+@@ -213,8 +276,25 @@
+         }
+     }
+ 
+-    fn notify_writable_streams(&self, streams: Vec<u64>) {
++    fn notify_writable_streams(&mut self, streams: Vec<u64>) {
+         for stream_id in streams {
++            if self
++                .streams
++                .get(&stream_id)
++                .is_some_and(|s| s.deferred_response.is_some())
++            {
++                if let Err(e) = self.flush_deferred_response(stream_id) {
++                    log_id!(
++                        debug,
++                        self.parent_id_chain,
++                        "Failed to send deferred response: stream id={} error={}",
++                        stream_id,
++                        e
++                    );
++                }
++                continue;
++            }
++
+             let r = match self
+                 .streams
+                 .get(&stream_id)
+@@ -318,6 +398,7 @@
+         match self {
+             StreamMessage::WaitingWritable(stream_id) => *stream_id,
+             StreamMessage::Shutdown(stream_id, _) => *stream_id,
++            StreamMessage::DeferredResponse(stream_id, _) => *stream_id,
+         }
+     }
+ }
+@@ -403,10 +484,12 @@
+ 
+ impl StreamSink {
+     fn try_send_pending_response(&mut self) -> io::Result<()> {
+-        if let Some((ref response, eof)) = self.pending_response {
+-            match self.socket.send_response(self.stream_id, response, false) {
++        let mut pending = self.pending_response.lock().unwrap();
++        if let Some((response, eof)) = pending.as_ref() {
++            let eof = *eof;
++            match self.socket.send_response(self.stream_id, response, eof) {
+                 Ok(()) => {
+-                    self.pending_response = None;
++                    *pending = None;
+                     if eof {
+                         self.codec_tx
+                             .send(StreamMessage::Shutdown(self.stream_id, None))
+@@ -465,8 +548,16 @@
+             eof
+         );
+ 
+-        self.pending_response = Some((response, eof));
++        *self.pending_response.lock().unwrap() = Some((response, eof));
+         self.try_send_pending_response()?;
++        if self.pending_response.lock().unwrap().is_some() {
++            self.codec_tx
++                .send(StreamMessage::DeferredResponse(
++                    self.stream_id,
++                    self.pending_response.clone(),
++                ))
++                .map_err(|_| io::Error::from(ErrorKind::UnexpectedEof))?;
++        }
+ 
+         Ok(self)
+     }
+@@ -489,7 +580,7 @@
+     }
+ 
+     fn write(&mut self, data: Bytes) -> io::Result<Bytes> {
+-        if self.pending_response.is_some() {
++        if self.pending_response.lock().unwrap().is_some() {
+             log_id!(
+                 error,
+                 self.id,
+@@ -516,6 +607,11 @@
+     }
+ 
+     fn eof(&mut self) -> io::Result<()> {
++        if let Some((_, eof)) = self.pending_response.lock().unwrap().as_mut() {
++            // The FIN follows the deferred response headers (`flush()`), never precedes them.
++            *eof = true;
++            return Ok(());
++        }
+         self.socket
+             .shutdown_stream(self.stream_id, quiche::Shutdown::Write);
+         Ok(())
+@@ -526,7 +622,7 @@
+     }
+ 
+     async fn flush(&mut self) -> io::Result<()> {
+-        while self.pending_response.is_some() {
++        while self.pending_response.lock().unwrap().is_some() {
+             self.codec_tx
+                 .send(StreamMessage::WaitingWritable(self.stream_id))
+                 .map_err(|_| io::Error::from(ErrorKind::UnexpectedEof))?;
+@@ -541,6 +637,13 @@
+ 
+ impl http_codec::DroppingSink for StreamSink {
+     fn write(&mut self, data: Bytes) -> io::Result<datagram_pipe::SendStatus> {
++        // Datagrams must not reach the stream before its response headers: quiche refuses DATA
++        // before HEADERS, and the multiplexer would close on that error.
++        self.try_send_pending_response()?;
++        if self.pending_response.lock().unwrap().is_some() {
++            return Ok(datagram_pipe::SendStatus::Dropped);
++        }
++
+         match self.socket.stream_capacity(self.stream_id) {
+             Ok(n) if n >= net_utils::http3_data_frame_overhead(data.len()) + data.len() => (),
+             Ok(_) => return Ok(datagram_pipe::SendStatus::Dropped),
+@@ -558,10 +661,16 @@
+ 
+ impl Drop for StreamSink {
+     fn drop(&mut self) {
+-        match self.codec_tx.send(StreamMessage::Shutdown(
+-            self.stream_id,
+-            Some(quiche::Shutdown::Write),
+-        )) {
++        // Response headers still waiting for stream capacity go to the codec, which sends them
++        // with FIN. A bare FIN before them would be a connection error for the client.
++        let message = match self.pending_response.lock().unwrap().as_mut() {
++            Some((_, eof)) => {
++                *eof = true;
++                StreamMessage::DeferredResponse(self.stream_id, self.pending_response.clone())
++            }
++            None => StreamMessage::Shutdown(self.stream_id, Some(quiche::Shutdown::Write)),
++        };
++        match self.codec_tx.send(message) {
+             Ok(_) => (),
+             Err(e) => log_id!(debug, self.id, "Failed to notify of write shutdown: {}", e),
+         }
+diff --git a/lib/src/quic_multiplexer.rs b/lib/src/quic_multiplexer.rs
+--- a/lib/src/quic_multiplexer.rs
++++ b/lib/src/quic_multiplexer.rs
+@@ -9,7 +9,7 @@
+ use lazy_static::lazy_static;
+ use quiche::h3;
+ use quiche::h3::NameValue;
+-use std::collections::{BTreeSet, HashMap, HashSet};
++use std::collections::{BTreeSet, HashMap};
+ use std::io;
+ use std::io::ErrorKind;
+ use std::net::SocketAddr;
+@@ -53,7 +53,7 @@
+     udp_socket: Arc<UdpSocket>,
+     quic_conn: Arc<std::sync::Mutex<QuicConnection>>,
+     h3_conn: Arc<std::sync::Mutex<h3::Connection>>,
+-    waiting_writable_streams: std::sync::Mutex<HashSet<u64>>,
++    waiting_writable_streams: std::sync::Mutex<HashMap<u64, usize>>,
+     id: log_utils::IdChain<u64>,
+     tls_connection_meta: tls_demultiplexer::ConnectionMeta,
+     /// TLS client_random extracted from QUIC handshake
+@@ -787,23 +787,29 @@
+         )
+         .collect();
+ 
+-        self.h3_conn
+-            .lock()
+-            .unwrap()
+-            .send_response(
+-                &mut self.quic_conn.lock().unwrap(),
+-                stream_id,
+-                response.as_slice(),
+-                fin,
+-            )
+-            .map_err(|e| {
+-                let kind = if matches!(e, h3::Error::StreamBlocked) {
+-                    ErrorKind::WouldBlock
+-                } else {
+-                    ErrorKind::Other
+-                };
+-                io::Error::new(kind, e.to_string())
+-            })?;
++        let result = {
++            let mut h3_conn = self.h3_conn.lock().unwrap();
++            let mut quic_conn = self.quic_conn.lock().unwrap();
++            let result = h3_conn.send_response(&mut quic_conn, stream_id, response.as_slice(), fin);
++            let mut waiting = self.waiting_writable_streams.lock().unwrap();
++            if matches!(result, Err(h3::Error::StreamBlocked)) {
++                // HEADERS are atomic: retry only when capacity grows, not merely when a
++                // few bytes suitable for a DATA frame are available.
++                let capacity = quic_conn.stream_capacity(stream_id).unwrap_or(0);
++                waiting.insert(stream_id, capacity.saturating_add(1));
++            } else {
++                waiting.remove(&stream_id);
++            }
++            result
++        };
++        result.map_err(|e| {
++            let kind = if matches!(e, h3::Error::StreamBlocked) {
++                ErrorKind::WouldBlock
++            } else {
++                ErrorKind::Other
++            };
++            io::Error::new(kind, e.to_string())
++        })?;
+ 
+         self.flush_pending_data()
+     }
+@@ -872,7 +878,8 @@
+         self.waiting_writable_streams
+             .lock()
+             .unwrap()
+-            .insert(stream_id);
++            .entry(stream_id)
++            .or_insert(net_utils::MIN_USABLE_QUIC_STREAM_CAPACITY);
+     }
+ 
+     pub fn shutdown_stream(&self, stream_id: u64, direction: quiche::Shutdown) {
+@@ -893,6 +900,20 @@
+                     .stream_shutdown(stream_id, direction, 0);
+             }
+         }
++        let _ = self.flush_pending_data();
++    }
++
++    pub fn reset_stream(&self, stream_id: u64) {
++        const H3_INTERNAL_ERROR: u64 = 0x0102;
++        {
++            let mut conn = self.quic_conn.lock().unwrap();
++            let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Read, H3_INTERNAL_ERROR);
++            let _ = conn.stream_shutdown(stream_id, quiche::Shutdown::Write, H3_INTERNAL_ERROR);
++        }
++        self.waiting_writable_streams
++            .lock()
++            .unwrap()
++            .remove(&stream_id);
+         let _ = self.flush_pending_data();
+     }
+ 
+@@ -925,14 +946,14 @@
+                             // Avoid emitting Writable events for streams with negligible capacity.
+                             let writable_streams: Vec<_> = waiting_streams
+                                 .iter()
+-                                .filter(|id| {
+-                                    quic_conn.stream_capacity(**id).map_or(true, |x| {
+-                                        x >= net_utils::MIN_USABLE_QUIC_STREAM_CAPACITY
+-                                    })
++                                .filter(|(id, threshold)| {
++                                    quic_conn
++                                        .stream_capacity(**id)
++                                        .map_or(true, |x| x >= **threshold)
+                                 })
+-                                .copied()
++                                .map(|(id, _)| *id)
+                                 .collect();
+-                            waiting_streams.retain(|id| !writable_streams.contains(id));
++                            waiting_streams.retain(|id, _| !writable_streams.contains(id));
+                             writable_streams
+                         };
+ 
+diff --git a/lib/tests/common/mod.rs b/lib/tests/common/mod.rs
+--- a/lib/tests/common/mod.rs
++++ b/lib/tests/common/mod.rs
+@@ -295,9 +295,9 @@
+ const MAX_QUIC_UDP_PAYLOAD_SIZE: usize = 1350;
+ 
+ pub struct Http3Session {
+-    socket: UdpSocket,
+-    quic_conn: quiche::Connection,
+-    h3_conn: h3::Connection,
++    pub(super) socket: UdpSocket,
++    pub(super) quic_conn: quiche::Connection,
++    pub(super) h3_conn: h3::Connection,
+     stream_id: Option<u64>,
+     is_tunnel: bool, // True for CONNECT requests - don't send FIN
+ }
+@@ -315,6 +315,15 @@
+         }
+     }
+     pub async fn connect(peer: &SocketAddr, server_name: &str, alpn: Option<&[u8]>) -> Self {
++        Self::connect_with_receive_window(peer, server_name, alpn, 10_000_000).await
++    }
++
++    pub async fn connect_with_receive_window(
++        peer: &SocketAddr,
++        server_name: &str,
++        alpn: Option<&[u8]>,
++        receive_window: u64,
++    ) -> Self {
+         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+ 
+         let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+@@ -325,7 +334,7 @@
+         config.set_max_idle_timeout(5000);
+         config.set_max_recv_udp_payload_size(MAX_QUIC_UDP_PAYLOAD_SIZE);
+         config.set_max_send_udp_payload_size(MAX_QUIC_UDP_PAYLOAD_SIZE);
+-        config.set_initial_max_data(10_000_000);
++        config.set_initial_max_data(receive_window);
+         config.set_initial_max_stream_data_bidi_local(1_000_000);
+         config.set_initial_max_stream_data_bidi_remote(1_000_000);
+         config.set_initial_max_stream_data_uni(1_000_000);
+@@ -550,7 +559,7 @@
+         }
+     }
+ 
+-    fn read_out_socket(socket: &UdpSocket, quic_conn: &mut quiche::Connection) {
++    pub(super) fn read_out_socket(socket: &UdpSocket, quic_conn: &mut quiche::Connection) {
+         let mut buffer = [0; MAX_QUIC_UDP_PAYLOAD_SIZE];
+         loop {
+             match socket.try_recv_from(&mut buffer) {
+@@ -676,7 +685,7 @@
+         ret
+     }
+ 
+-    fn flush_quic_data(socket: &UdpSocket, quic_conn: &mut quiche::Connection) {
++    pub(super) fn flush_quic_data(socket: &UdpSocket, quic_conn: &mut quiche::Connection) {
+         let mut buffer = [0; MAX_QUIC_UDP_PAYLOAD_SIZE];
+         loop {
+             match quic_conn.send(&mut buffer) {
+diff --git a/lib/tests/http3_backpressure.rs b/lib/tests/http3_backpressure.rs
+new file mode 100644
+--- /dev/null
++++ b/lib/tests/http3_backpressure.rs
+@@ -0,0 +1,242 @@
++use quiche::h3::{self, NameValue};
++use std::collections::HashSet;
++use std::net::Ipv4Addr;
++use std::time::Duration;
++use tokio::net::UdpSocket;
++
++#[allow(dead_code)]
++mod common;
++
++#[tokio::test]
++async fn health_checks_keep_headers_before_fin_when_connection_window_is_full() {
++    terminal_responses_under_backpressure(b"_check", b"200").await;
++}
++
++#[tokio::test]
++async fn failed_connects_keep_headers_before_fin_when_connection_window_is_full() {
++    terminal_responses_under_backpressure(b"127.0.0.1:0", b"502").await;
++}
++
++#[tokio::test]
++async fn udp_replies_wait_for_response_headers_under_backpressure() {
++    common::set_up_logger();
++    let endpoint_address = common::make_endpoint_address();
++    let echo_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
++    let echo_address = echo_socket.local_addr().unwrap();
++    let (first_reply_tx, first_reply_rx) = tokio::sync::oneshot::channel();
++    let echo = async move {
++        let mut first_reply_tx = Some(first_reply_tx);
++        loop {
++            let mut buf = [0; 1024];
++            let (n, peer) = echo_socket.recv_from(&mut buf).await.unwrap();
++            echo_socket.send_to(&buf[..n], peer).await.unwrap();
++            if let Some(tx) = first_reply_tx.take() {
++                tx.send(()).unwrap();
++            }
++        }
++    };
++    let client = async {
++        let mut session = common::Http3Session::connect_with_receive_window(
++            &endpoint_address,
++            common::MAIN_DOMAIN_NAME,
++            None,
++            128,
++        )
++        .await;
++        for _ in 0..64 {
++            session
++                .h3_conn
++                .send_request(
++                    &mut session.quic_conn,
++                    &[
++                        h3::Header::new(b":method", b"CONNECT"),
++                        h3::Header::new(b":authority", b"_check"),
++                    ],
++                    true,
++                )
++                .unwrap();
++        }
++        let udp_stream = session
++            .h3_conn
++            .send_request(
++                &mut session.quic_conn,
++                &[
++                    h3::Header::new(b":method", b"CONNECT"),
++                    h3::Header::new(b":authority", b"_udp2"),
++                ],
++                false,
++            )
++            .unwrap();
++        let payload = b"quic-dns";
++        let mut packet = Vec::new();
++        packet.extend_from_slice(&(37 + payload.len() as u32).to_be_bytes());
++        packet.extend_from_slice(&[0; 12]);
++        packet.extend_from_slice(&Ipv4Addr::LOCALHOST.octets());
++        packet.extend_from_slice(&1234u16.to_be_bytes());
++        packet.extend_from_slice(&[0; 12]);
++        packet.extend_from_slice(&Ipv4Addr::LOCALHOST.octets());
++        packet.extend_from_slice(&echo_address.port().to_be_bytes());
++        packet.push(0);
++        packet.extend_from_slice(payload);
++        assert_eq!(
++            session
++                .h3_conn
++                .send_body(&mut session.quic_conn, udp_stream, &packet, false)
++                .unwrap(),
++            packet.len()
++        );
++        common::Http3Session::flush_quic_data(&session.socket, &mut session.quic_conn);
++        first_reply_rx.await.unwrap();
++        tokio::time::sleep(Duration::from_millis(100)).await;
++
++        let mut headers = HashSet::new();
++        let mut finished = HashSet::new();
++        let mut udp_body = Vec::new();
++        while finished.len() < 64 || !udp_body.ends_with(payload) {
++            common::Http3Session::read_out_socket(&session.socket, &mut session.quic_conn);
++            loop {
++                match session.h3_conn.poll(&mut session.quic_conn) {
++                    Ok((id, h3::Event::Headers { list, .. })) => {
++                        assert!(list
++                            .iter()
++                            .any(|h| h.name() == b":status" && h.value() == b"200"));
++                        headers.insert(id);
++                        if id == udp_stream {
++                            session
++                                .h3_conn
++                                .send_body(&mut session.quic_conn, udp_stream, &packet, false)
++                                .unwrap();
++                        }
++                    }
++                    Ok((id, h3::Event::Finished)) => {
++                        assert!(headers.contains(&id));
++                        assert_ne!(
++                            id, udp_stream,
++                            "UDP tunnel was closed while headers were deferred"
++                        );
++                        finished.insert(id);
++                    }
++                    Ok((id, h3::Event::Data)) => {
++                        assert_eq!(id, udp_stream);
++                        assert!(headers.contains(&id));
++                        let mut buf = [0; 1024];
++                        loop {
++                            match session
++                                .h3_conn
++                                .recv_body(&mut session.quic_conn, id, &mut buf)
++                            {
++                                Ok(n) => udp_body.extend_from_slice(&buf[..n]),
++                                Err(h3::Error::Done) => break,
++                                Err(e) => panic!("UDP body read failed: {e}"),
++                            }
++                        }
++                    }
++                    Ok((id, event)) => panic!("unexpected event on stream {id}: {event:?}"),
++                    Err(h3::Error::Done) => break,
++                    Err(e) => panic!("HTTP/3 UDP tunnel failed under backpressure: {e}"),
++                }
++            }
++            assert!(!session.quic_conn.is_closed());
++            assert!(session.quic_conn.peer_error().is_none());
++            common::Http3Session::flush_quic_data(&session.socket, &mut session.quic_conn);
++            let timeout = session
++                .quic_conn
++                .timeout()
++                .unwrap_or(Duration::from_secs(1));
++            let wait = timeout.min(Duration::from_millis(20));
++            if tokio::time::timeout(wait, session.socket.readable())
++                .await
++                .is_err()
++                && wait == timeout
++            {
++                session.quic_conn.on_timeout();
++            }
++        }
++    };
++    tokio::select! {
++        _ = common::run_endpoint(&endpoint_address) => panic!("endpoint stopped"),
++        _ = echo => unreachable!(),
++        _ = client => (),
++        _ = tokio::time::sleep(Duration::from_secs(10)) => panic!("UDP backpressure test timed out"),
++    }
++}
++
++async fn terminal_responses_under_backpressure(authority: &[u8], status: &[u8]) {
++    common::set_up_logger();
++    let endpoint_address = common::make_endpoint_address();
++    let client = async {
++        let mut session = common::Http3Session::connect_with_receive_window(
++            &endpoint_address,
++            common::MAIN_DOMAIN_NAME,
++            None,
++            128,
++        )
++        .await;
++        let request = [
++            h3::Header::new(b":method", b"CONNECT"),
++            h3::Header::new(b":authority", authority),
++        ];
++        let mut requested = HashSet::new();
++        for _ in 0..64 {
++            requested.insert(
++                session
++                    .h3_conn
++                    .send_request(&mut session.quic_conn, &request, true)
++                    .unwrap(),
++            );
++        }
++        common::Http3Session::flush_quic_data(&session.socket, &mut session.quic_conn);
++        // Let replies exhaust the receive window before the client consumes any headers.
++        tokio::time::sleep(Duration::from_millis(200)).await;
++
++        let mut headers = HashSet::new();
++        let mut finished = HashSet::new();
++        while finished.len() < requested.len() {
++            common::Http3Session::read_out_socket(&session.socket, &mut session.quic_conn);
++            loop {
++                match session.h3_conn.poll(&mut session.quic_conn) {
++                    Ok((id, h3::Event::Headers { list, .. })) => {
++                        assert!(requested.contains(&id));
++                        assert!(list
++                            .iter()
++                            .any(|h| h.name() == b":status" && h.value() == status));
++                        headers.insert(id);
++                    }
++                    Ok((id, h3::Event::Finished)) => {
++                        assert!(
++                            headers.contains(&id),
++                            "stream {id} finished before response headers"
++                        );
++                        finished.insert(id);
++                    }
++                    Ok((id, event)) => panic!("unexpected event on stream {id}: {event:?}"),
++                    Err(h3::Error::Done) => break,
++                    Err(e) => panic!("HTTP/3 failed under backpressure: {e}"),
++                }
++            }
++            assert!(!session.quic_conn.is_closed());
++            assert!(session.quic_conn.peer_error().is_none());
++            common::Http3Session::flush_quic_data(&session.socket, &mut session.quic_conn);
++            if finished.len() < requested.len() {
++                let timeout = session
++                    .quic_conn
++                    .timeout()
++                    .unwrap_or(Duration::from_secs(1));
++                let wait = timeout.min(Duration::from_millis(20));
++                if tokio::time::timeout(wait, session.socket.readable())
++                    .await
++                    .is_err()
++                    && wait == timeout
++                {
++                    session.quic_conn.on_timeout();
++                }
++            }
++        }
++        assert_eq!(headers, requested);
++    };
++    tokio::select! {
++        _ = common::run_endpoint(&endpoint_address) => panic!("endpoint stopped"),
++        _ = client => (),
++        _ = tokio::time::sleep(Duration::from_secs(10)) => panic!("backpressure test timed out"),
++    }
++}

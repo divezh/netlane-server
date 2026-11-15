@@ -182,18 +182,26 @@ function Build-Bundle {
         Invoke-Native 'git' @('-C', $upstream, '-c', 'core.autocrlf=false', 'checkout', '--quiet', $upstreamCommit)
     }
     if ((& git -C $upstream rev-parse HEAD).Trim() -ne $upstreamCommit) { throw "research\upstream is not at the pinned commit $upstreamCommit." }
-    $last = $patches[-1].FullName
-    if (Test-Quiet 'git' @('-C', $upstream, 'apply', '--reverse', '--check', $last)) {
-        Write-Host 'Patches already applied: incremental build.'
-    } else {
-        $dirty = & git -C $upstream status --porcelain --untracked-files=no
-        if ($dirty) { throw 'research\upstream has local changes and the patches are not applied. Clean it or delete the folder.' }
-        foreach ($patch in $patches) { Invoke-Native 'git' @('-C', $upstream, 'apply', $patch.FullName) }
+    # Later patches can alter the context of earlier ones. Recognize the latest applied
+    # patch, then append the missing suffix without resetting the existing worktree.
+    $appliedThrough = -1
+    for ($i = $patches.Count - 1; $i -ge 0; $i--) {
+        if (Test-Quiet 'git' @('-C', $upstream, 'apply', '--reverse', '--check', $patches[$i].FullName)) {
+            $appliedThrough = $i
+            break
+        }
+    }
+    if ($appliedThrough -lt 0 -and (& git -C $upstream status --porcelain --untracked-files=no)) {
+        throw 'research\upstream has unrecognized local changes; no files were reset.'
+    }
+    for ($i = $appliedThrough + 1; $i -lt $patches.Count; $i++) {
+        Invoke-Native 'git' @('-C', $upstream, 'apply', '--check', $patches[$i].FullName)
+        Invoke-Native 'git' @('-C', $upstream, 'apply', $patches[$i].FullName)
     }
     Invoke-Native 'docker' @('build', '-q', '-t', 'tt-upstream-test', '-f', (Join-Path $root 'deploy\ci\upstream.Dockerfile'), (Join-Path $root 'deploy\ci'))
     $cargo = 'cargo build --locked -p trusttunnel_endpoint'
     if (-not $SkipTests) {
-        $cargo = 'cargo fmt --all -- --check && cargo clippy --locked -- -D warnings && cargo test --locked -p trusttunnel --lib && cargo test --locked -p trusttunnel --test managed && cargo test --locked -p trusttunnel_endpoint --bin trusttunnel_endpoint && ' + $cargo
+        $cargo = 'cargo fmt --all -- --check && cargo clippy --locked -- -D warnings && cargo test --locked --workspace && ' + $cargo
     }
     # Target and registry live in Docker volumes: much faster than a Windows bind mount and kept between runs.
     Invoke-Native 'docker' @('run', '--rm', '-v', "${upstream}:/src", '-v', 'netlane-cargo-target:/src/target', '-v', 'netlane-cargo-registry:/usr/local/cargo/registry', '-v', "${artifacts}:/out",
