@@ -99,6 +99,9 @@ cfg=json.load(open('/etc/trusttunnel-admin/config.json'))
 expected=os.environ.get('EXPECTED_PANEL_LISTEN','127.0.0.1:8443')
 assert cfg['listen']==expected,cfg['listen']
 assert stat.S_IMODE(os.stat('/etc/trusttunnel-admin/config.json').st_mode)==0o600
+network=Path('/etc/sysctl.d/92-netlane-udp.conf')
+assert network.is_file() and network.stat().st_uid==0 and stat.S_IMODE(network.stat().st_mode)==0o644
+assert 'net.core.rmem_default = ' in network.read_text() and 'net.core.wmem_default = ' in network.read_text()
 for unit in ['trusttunnel-managed','trusttunnel-admin','fail2ban','certbot.timer','trusttunnel-backup.timer']:
  run('systemctl','is-active','--quiet',unit)
 for unit in ['trusttunnel-managed','trusttunnel-admin']:
@@ -207,7 +210,11 @@ def scenario(bundle, kind):
             execute(name, "sed -i 's/^Description=.*/Description=Daily Netlane backup at legacy-zone/; s/^OnCalendar=.*/OnCalendar=*-*-* 01:17:00 UTC/' /etc/systemd/system/trusttunnel-backup.timer; systemctl daemon-reload; printf '%040d\\n' 1 >/root/netlane/SOURCE_COMMIT; tar -czf /root/update.tar.gz -C /root/netlane .; sha256sum /root/update.tar.gz >/root/update.tar.gz.sha256; openssl ecparam -name prime256v1 -genkey -noout -out /root/test-release.key; openssl ec -in /root/test-release.key -pubout -out /root/test-release.pub; openssl dgst -sha256 -sign /root/test-release.key -out /root/update.tar.gz.sig /root/update.tar.gz")
             # A test bundle is signed with a throwaway key: the updater checks the signature as for a release.
             log.append(execute(name, 'NETLANE_RELEASE_KEY_FILE=/root/test-release.pub bash /root/netlane/update.sh --file /root/update.tar.gz').stdout)
-            execute(name, "printf x >>/root/update.tar.gz.sig; ! NETLANE_RELEASE_KEY_FILE=/root/test-release.pub bash /root/netlane/update.sh --file /root/update.tar.gz")
+            # An old updater only copies the new script at the end. Its next idle timer
+            # must finish the tuning even when the panel has not requested another update.
+            execute(name, 'rm /etc/sysctl.d/92-netlane-udp.conf; rm -f /var/lib/trusttunnel-admin/update-requested; /usr/local/sbin/netlane-update --requested; test -s /etc/sysctl.d/92-netlane-udp.conf')
+            # Alter the DER signature itself; OpenSSL may ignore bytes appended after it.
+            execute(name, "printf '\\000' | dd of=/root/update.tar.gz.sig bs=1 count=1 conv=notrunc status=none; ! NETLANE_RELEASE_KEY_FILE=/root/test-release.pub bash /root/netlane/update.sh --file /root/update.tar.gz")
             execute(name, "grep -F 'Description=Daily Netlane backup at 04:00 MSK' /etc/systemd/system/trusttunnel-backup.timer; grep -Fx 'OnCalendar=*-*-* 01:17:00 UTC' /etc/systemd/system/trusttunnel-backup.timer")
             print(f'PASS Ubuntu {args.ubuntu_version}: actual updater, MSK label and preserved custom schedule',flush=True)
         # A completed installation is not an updater. It must refuse both entry points.
@@ -216,6 +223,8 @@ def scenario(bundle, kind):
         print(f'PASS Ubuntu {args.ubuntu_version}:', kind, flush=True)
     finally:
         access = subprocess.run(['docker', 'exec', name, 'bash', '-c', "stat -c '%a %U:%G %n' /run/trusttunnel /run/trusttunnel/control.sock 2>&1; runuser -u trusttunnel-admin -- id; runuser -u trusttunnel-admin -- /usr/bin/test -r /run/trusttunnel/control.sock; echo read_status=$?; runuser -u trusttunnel-admin -- /usr/bin/test -w /run/trusttunnel/control.sock; echo write_status=$?"], text=True, capture_output=True)
+        install_diagnostics = subprocess.run(['docker', 'exec', name, 'cat', '/var/log/netlane-setup-install.log'], text=True, encoding="utf-8", errors="replace", capture_output=True)
+        log.append(install_diagnostics.stdout)
         diagnostics = subprocess.run(['docker', 'exec', name, 'journalctl', '-b', '--no-pager', '-u', 'trusttunnel-managed', '-u', 'trusttunnel-admin', '-u', 'fail2ban'], text=True, encoding="utf-8", errors="replace", capture_output=True)
         (RESULTS / (kind + '.log')).write_text('\n'.join(log) + '\n' + access.stdout + access.stderr + diagnostics.stdout + diagnostics.stderr, encoding='utf-8')
         subprocess.run(['docker', 'rm', '-f', name], capture_output=True)

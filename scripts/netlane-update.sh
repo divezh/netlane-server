@@ -9,6 +9,7 @@
 #   netlane-update --requested     update only when the console left a request (systemd timer)
 #   netlane-update --file F.tar.gz install a downloaded trusttunnel-dev.tar.gz (F.tar.gz.sha256 next to it)
 #   netlane-update --set-token     save a GitHub token (optional: raises GitHub's limit of 60 requests an hour)
+#   netlane-update --configure-network apply persistent UDP queue settings without updating binaries
 #
 # Installed by install.sh as /usr/local/sbin/netlane-update.
 set -euo pipefail
@@ -50,7 +51,7 @@ warn() { printf '%s! %s%s\n' "$yellow" "$*" "$reset" >&2; }
 fail_reason=''
 die() { fail_reason="$*"; printf '%sОшибка: %s%s\n' "$red" "$*" "$reset" >&2; exit 1; }
 
-check_only=0 assume_yes=0 file='' set_token=0 requested=0
+check_only=0 assume_yes=0 file='' set_token=0 requested=0 configure_network_only=0
 while (($#)); do
   case $1 in
     --check) check_only=1 ;;
@@ -60,7 +61,8 @@ while (($#)); do
     --channel) ;; # accepted for old timers and habits: there is only one source now
     --requested) requested=1 ;;
     --set-token) set_token=1 ;;
-    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --configure-network) configure_network_only=1 ;;
+    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "неизвестный параметр: $1 (см. netlane-update --help)" ;;
   esac
   shift
@@ -160,7 +162,83 @@ UNIT
   systemctl enable --now trusttunnel-update.path trusttunnel-update.timer >/dev/null 2>&1 ||
     warn 'запуск обновления из панели не включился; обновляйте по SSH'
 }
+configure_network() {
+  python3 - <<'NETLANE_NETWORK_PY'
+import os
+from pathlib import Path
+import stat
+import subprocess
+import tempfile
+
+MINIMUM = {
+    'net.core.rmem_max': 7500000,
+    'net.core.wmem_max': 7500000,
+    'net.core.rmem_default': 4194304,
+    'net.core.wmem_default': 4194304,
+}
+
+
+def configure(path=Path('/etc/sysctl.d/92-netlane-udp.conf'), run=subprocess.run):
+    # Root only writes through trusted directories and never follows a config symlink.
+    for parent in (path.parent, *path.parent.parents):
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError(f'untrusted directory: {parent}')
+    previous = ''
+    if path.exists() or path.is_symlink():
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError(f'untrusted config: {path}')
+        previous = path.read_text()
+    saved = {}
+    for line in previous.splitlines():
+        key, sep, value = line.partition('=')
+        if sep and key.strip() in MINIMUM and value.strip().isdigit():
+            saved[key.strip()] = int(value.strip())
+    current = {}
+    for key in MINIMUM:
+        result = run(['sysctl', '-n', key], capture_output=True, text=True, check=True)
+        current[key] = int(result.stdout.strip())
+    values = {key: max(floor, current[key], saved.get(key, 0)) for key, floor in MINIMUM.items()}
+    for direction in ('rmem', 'wmem'):
+        key = f'net.core.{direction}_max'
+        values[key] = max(values[key], values[f'net.core.{direction}_default'])
+    content = '# Netlane: UDP queues for HTTP/3 (bytes); higher existing values are preserved.\n'
+    content += ''.join(f'{key} = {value}\n' for key, value in values.items())
+    if previous != content:
+        fd, name = tempfile.mkstemp(prefix='.netlane-udp-', dir=path.parent)
+        try:
+            with os.fdopen(fd, 'w') as output:
+                os.fchmod(output.fileno(), 0o644)
+                output.write(content)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(name, path)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+    if current != values:
+        run(['sysctl', '-q', '-p', str(path)], check=True)
+        for key, value in values.items():
+            result = run(['sysctl', '-n', key], capture_output=True, text=True, check=True)
+            if int(result.stdout.strip()) < value:
+                raise ValueError(f'{key} remains below {value}; hosting kernel may restrict sysctl')
+        print('Netlane: UDP defaults >= 4 MiB, limits >= 7500000 bytes configured.')
+
+
+if __name__ == '__main__':
+    try:
+        configure()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        # Restricted VPS kernels must not prevent installing or running the VPN.
+        print(f'Netlane: could not tune system UDP buffers: {error}', file=__import__('sys').stderr)
+NETLANE_NETWORK_PY
+}
 ((EUID == 0)) || die 'запустите от root: sudo netlane-update'
+# Also runs before an empty --requested exits: the first timer invocation after an old
+# updater installs this script completes the system tuning without another upgrade.
+if ((!check_only && !set_token)); then configure_network; fi
+((configure_network_only)) && exit 0
 # Readable by the console (it shows the report), writable by root only.
 install -d -m 0755 -o root -g root "${REPORT_DIR%/*}" "$REPORT_DIR"
 chmod 0755 "${REPORT_DIR%/*}"

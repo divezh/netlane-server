@@ -4,7 +4,7 @@
 
 Закреплённая база: тег `v1.1.0`, commit `fab5b8353a19332f935fa30869307d37d4a898d1`. Лицензия upstream: Apache-2.0, копия рядом в `LICENSE.TrustTunnel`. Проект панели независим от разработчиков TrustTunnel.
 
-Управляемый бинарник явно помечает версию суффиксом `-admin-preview.5-quic.1`, чтобы не выдавать изменённую сборку за официальный релиз. `quic.1` обозначает исправление HTTP/3 поверх прежнего managed API и формата состояния.
+Управляемый бинарник явно помечает версию суффиксом `-admin-preview.5-quic.2`, чтобы не выдавать изменённую сборку за официальный релиз. `quic.1` обозначает исправление порядка HTTP/3-ответов, `quic.2` добавляет настройку UDP-буферов; managed API и формат состояния сохраняются.
 
 Патч `patches/0001-reload-credentials.patch` изменяет исходные файлы upstream:
 
@@ -31,6 +31,7 @@ git -C research/upstream apply ../../upstream/patches/0005-remove-managed-users.
 git -C research/upstream apply ../../upstream/patches/0006-dependency-security-updates.patch
 git -C research/upstream apply ../../upstream/patches/0007-block-bittorrent.patch
 git -C research/upstream apply ../../upstream/patches/0008-http3-deferred-response.patch
+git -C research/upstream apply ../../upstream/patches/0009-quic-socket-buffers.patch
 docker build -t tt-upstream-test -f deploy/ci/upstream.Dockerfile deploy/ci
 docker run --rm -v "$PWD/research/upstream:/src" tt-upstream-test \
   bash -c 'cargo fmt --all -- --check && cargo clippy --locked -- -D warnings && cargo test --locked --workspace'
@@ -41,6 +42,8 @@ docker run --rm -v "$PWD/research/upstream:/src" tt-upstream-test \
 Патч `0005-remove-managed-users.patch` добавляет capability `remove_user` и версионированную команду удаления. Сессии и credentials отзываются после сохранения managed state; журнал расхода сохраняется. Повтор по отсутствующему ID не удаляет нового пользователя с тем же именем.
 
 Патч `0008-http3-deferred-response.patch` сохраняет отложенные заголовки ответа до отправки, в том числе после уничтожения sink и при отсутствии новых UDP-пакетов. FIN и DATA не опережают HEADERS; повтор после `StreamBlocked` ждёт увеличения доступного окна вместо цикла с загрузкой CPU. Три регрессионных теста используют настоящий локальный QUIC endpoint с ограниченным окном: health check, неудачный CONNECT и UDP echo. [Причина обрыва и проверка](../docs/HTTP3.md).
+
+Патч `0009-quic-socket-buffers.patch` запрашивает через `SO_RCVBUF`/`SO_SNDBUF` буферы QUIC-сокета по 4 МиБ, если фактический размер меньше. Лимиты ОС сохраняются; ошибки настройки не останавливают VPN. Журнал содержит фактические размеры, которые Linux может показывать удвоенными из-за учёта служебных данных. Тесты используют реальные UDP-сокеты: увеличение маленьких очередей, передача пакета и повторная настройка без изменения полученных размеров. Подробности диагностики скорости — в [HTTP3.md](../docs/HTTP3.md#низкая-скорость-и-udp-буферы).
 
 Патч `0006-dependency-security-updates.patch` меняет `Cargo.lock` и одну строку `lib/src/icmp_forwarder.rs` (`AsyncFd::register` вместо устаревшего небезопасного `AsyncFd::new`, RUSTSEC-2026-0386): h2 0.4.20, rustls 0.23.46, rustls-webpki 0.103.17, webpki-roots 1.0.12, tokio 1.54.1, rustix 1.1.6, quinn-proto 0.11.19, quinn-udp 0.5.16 — исправления известных уязвимостей (RustSec). Остаётся h2 0.3.27 (прямая зависимость upstream, исправления для ветки 0.3 нет; уязвимость низкой важности) — CI проверяет остальное `cargo audit`.
 

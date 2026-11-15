@@ -76,7 +76,7 @@ if [[ -n ${TT_PANEL_ALLOW:-} && ${TT_FIREWALL:-0} != 1 ]]; then
   fi
 fi
 apt-get update -qq </dev/null
-apt-get install -y -qq --no-install-recommends ca-certificates certbot openssl python3 iproute2 fail2ban curl </dev/null
+apt-get install -y -qq --no-install-recommends ca-certificates certbot openssl python3 procps iproute2 fail2ban curl </dev/null
 endpoint_running=0; panel_running=0
 systemctl is-active --quiet trusttunnel-managed && endpoint_running=1
 systemctl is-active --quiet trusttunnel-admin && panel_running=1
@@ -351,6 +351,8 @@ if [[ $role == main ]]; then
 fi
 service=trusttunnel-admin
 [[ $role == node ]] && service=trusttunnel-node
+# Persist and apply UDP queue sizes before the endpoint opens its sockets.
+bash "$root/update.sh" --configure-network
 # BBR with fair queueing usually improves VPN throughput on lossy client networks.
 if modprobe tcp_bbr 2>/dev/null && [[ ! -e /etc/sysctl.d/90-trusttunnel.conf ]]; then
   printf '# Netlane: BBR congestion control with fair queueing.\nnet.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' >/etc/sysctl.d/90-trusttunnel.conf

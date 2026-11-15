@@ -1,0 +1,147 @@
+diff --git a/AGENTS.md b/AGENTS.md
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -180,6 +180,7 @@
+ ### II. Code Quality Standards
+ 
+ - Preserve pending HTTP/3 response headers until delivery or stream reset; never send DATA or FIN first.
++- Request QUIC UDP socket buffer sizes explicitly; raising kernel maxima does not enlarge existing sockets.
+ 
+ 1. Follow `rustfmt` defaults. Validate with `make lint-rust`.
+ 
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,9 @@
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+ 
+ ## [Unreleased]
++
++- [Fix] QUIC requests 4 MiB receive/send socket buffers within OS limits and logs
++  effective sizes, reducing avoidable UDP queue drops under bursty traffic.
+ 
+ - [Fix] HTTP/3 retains deferred response headers through sink teardown and UDP
+   inactivity, sends HEADERS before DATA/FIN, and waits for capacity growth before retrying.
+diff --git a/endpoint/src/main.rs b/endpoint/src/main.rs
+--- a/endpoint/src/main.rs
++++ b/endpoint/src/main.rs
+@@ -15,7 +15,7 @@
+ use trusttunnel::{log_utils, settings};
+ mod management;
+ 
+-const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.5-quic.1");
++const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.5-quic.2");
+ const VERSION_PARAM_NAME: &str = "v_e_r_s_i_o_n_do_not_change_this_name_it_will_break";
+ const LOG_LEVEL_PARAM_NAME: &str = "log_level";
+ const LOG_FILE_PARAM_NAME: &str = "log_file";
+diff --git a/lib/src/quic_multiplexer.rs b/lib/src/quic_multiplexer.rs
+--- a/lib/src/quic_multiplexer.rs
++++ b/lib/src/quic_multiplexer.rs
+@@ -9,6 +9,7 @@
+ use lazy_static::lazy_static;
+ use quiche::h3;
+ use quiche::h3::NameValue;
++use socket2::SockRef;
+ use std::collections::{BTreeSet, HashMap};
+ use std::io;
+ use std::io::ErrorKind;
+@@ -25,6 +26,7 @@
+ const SOCKET_ID_FMT: &str = "QSOCK={}";
+ 
+ const QUIC_CONNECTION_CLOSE_CODE: u64 = 0x42;
++const QUIC_UDP_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+ 
+ type QuicConnection = quiche::Connection;
+ 
+@@ -137,6 +139,8 @@
+             .unwrap()
+             .message_queue_capacity;
+         let (tx, rx) = mpsc::channel(queue_cap);
++
++        configure_udp_buffers(&socket);
+ 
+         Ok(Self {
+             core_settings,
+@@ -752,6 +756,82 @@
+     }
+ }
+ 
++fn configure_udp_buffers(socket: &UdpSocket) {
++    let socket = SockRef::from(socket);
++    if socket
++        .recv_buffer_size()
++        .is_ok_and(|n| n < QUIC_UDP_BUFFER_SIZE)
++    {
++        if let Err(e) = socket.set_recv_buffer_size(QUIC_UDP_BUFFER_SIZE) {
++            log::warn!("Could not enlarge QUIC UDP receive buffer: {}", e);
++        }
++    }
++    if socket
++        .send_buffer_size()
++        .is_ok_and(|n| n < QUIC_UDP_BUFFER_SIZE)
++    {
++        if let Err(e) = socket.set_send_buffer_size(QUIC_UDP_BUFFER_SIZE) {
++            log::warn!("Could not enlarge QUIC UDP send buffer: {}", e);
++        }
++    }
++    match (socket.recv_buffer_size(), socket.send_buffer_size()) {
++        (Ok(receive), Ok(send)) => log::info!(
++            "QUIC UDP socket buffers: receive={} send={} bytes (request={} per direction; kernel limits apply)",
++            receive, send, QUIC_UDP_BUFFER_SIZE
++        ),
++        _ => log::warn!("Could not read effective QUIC UDP socket buffer sizes"),
++    }
++}
++
++#[cfg(test)]
++mod buffer_tests {
++    use super::*;
++    use std::net::Ipv4Addr;
++
++    #[tokio::test]
++    async fn expands_udp_queues_and_keeps_socket_usable() {
++        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
++        let reference = SockRef::from(&socket);
++        reference.set_recv_buffer_size(4096).unwrap();
++        reference.set_send_buffer_size(4096).unwrap();
++        let before = (
++            reference.recv_buffer_size().unwrap(),
++            reference.send_buffer_size().unwrap(),
++        );
++
++        configure_udp_buffers(&socket);
++
++        assert!(reference.recv_buffer_size().unwrap() > before.0);
++        assert!(reference.send_buffer_size().unwrap() > before.1);
++        let peer = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
++        peer.send_to(b"quic-buffer-check", socket.local_addr().unwrap())
++            .await
++            .unwrap();
++        let mut buf = [0; 64];
++        let (n, _) = tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut buf))
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(&buf[..n], b"quic-buffer-check");
++    }
++
++    #[tokio::test]
++    async fn keeps_effective_buffers_on_repeated_configuration() {
++        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
++        configure_udp_buffers(&socket);
++        let reference = SockRef::from(&socket);
++        let first = (
++            reference.recv_buffer_size().unwrap(),
++            reference.send_buffer_size().unwrap(),
++        );
++
++        configure_udp_buffers(&socket);
++
++        assert_eq!(reference.recv_buffer_size().unwrap(), first.0);
++        assert_eq!(reference.send_buffer_size().unwrap(), first.1);
++    }
++}
++
+ impl QuicSocket {
+     pub fn id(&self) -> log_utils::IdChain<u64> {
+         self.id.clone()

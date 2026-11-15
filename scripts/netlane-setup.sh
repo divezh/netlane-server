@@ -453,7 +453,7 @@ TT_RESUME="$resume" TT_PANEL_ALLOW="$panel_allow" TT_PANEL_PUBLIC="$panel_public
 step 'Пакеты'
 apt_get update
 ((upgrade)) && { say 'Обновляю систему (может занять несколько минут)…'; apt_get full-upgrade; }
-apt_get install --no-install-recommends ca-certificates curl ufw fail2ban python3 iproute2 openssl
+apt_get install --no-install-recommends ca-certificates curl ufw fail2ban python3 procps iproute2 openssl
 if ((auto_updates)); then
   apt_get install --no-install-recommends unattended-upgrades
   cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
@@ -489,12 +489,12 @@ if ((swap)); then
 fi
 
 step 'Сеть'
-# BBR and fair queueing are set by install.sh. These help QUIC (large UDP buffers), many
+# Preserve larger UDP queues before applying the remaining network settings.
+bash "$bundle/update.sh" --configure-network
+# BBR and fair queueing are set by install.sh. These help many
 # clients (backlog) and paths that drop ICMP (MTU probing). Values are conservative.
 cat >/etc/sysctl.d/91-netlane-net.conf <<'EOF'
 # Netlane network tuning.
-net.core.rmem_max = 7500000
-net.core.wmem_max = 7500000
 net.core.netdev_max_backlog = 16384
 net.core.somaxconn = 4096
 net.ipv4.tcp_max_syn_backlog = 8192

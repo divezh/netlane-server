@@ -10,8 +10,10 @@
    IP. Домен ноды не совпадает с доменом main.
 2. В панели main: «Ноды → Добавить ноду». Панель покажет команду с кодом приглашения: он
    действует 24 часа и подходит для одной ноды.
-3. На новом VPS от root положите `trusttunnel-dev.tar.gz`, `.sha256` и `.sig` из релиза в `/root` и выполните команду из
-   панели:
+3. Из одного [последнего релиза](https://github.com/divezh/netlane-server/releases/latest) скачайте все три файла:
+   `trusttunnel-dev.tar.gz`, `trusttunnel-dev.tar.gz.sha256` и `trusttunnel-dev.tar.gz.sig`.
+   На новом VPS положите их в `/root` и выполните от root команду из панели.
+   Она проверит контрольную сумму и подпись комплекта перед запуском установки:
 
    ```sh
    cd /root && sha256sum -c trusttunnel-dev.tar.gz.sha256 && printf '%s\n' <открытый ключ> >netlane-release.pub && openssl dgst -sha256 -verify netlane-release.pub -signature trusttunnel-dev.tar.gz.sig trusttunnel-dev.tar.gz && netlane_node_dir=$(mktemp -d /root/netlane-node.XXXXXX) && tar -xzf trusttunnel-dev.tar.gz -C "$netlane_node_dir" && bash "$netlane_node_dir/setup.sh" --join 'https://<main>/<префикс>/node/join#<код>'

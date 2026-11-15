@@ -49,6 +49,7 @@ powershell -ExecutionPolicy Bypass -File scripts/build-local.ps1 -Bundle
 | Дашборды и автообновление | `node scripts/test-web-presence.mjs` |
 | Установщик и восстановление | `python scripts/test-dev-install.py --panel artifacts/trusttunnel-admin --endpoint artifacts/trusttunnel_endpoint` |
 | Ранние проверки setup/install | `python3 scripts/test-setup-startup.py` в одноразовом Linux-контейнере от root |
+| UDP-настройки VPS | `sudo python3 scripts/test-network-tuning.py` (подменяет sysctl, параметры хоста не меняет) |
 | Shell | ShellCheck изменённых скриптов |
 
 Браузерному тесту нужны `playwright-core` и Edge. Путь к внешней установке пакета можно задать через `TT_PLAYWRIGHT_MODULE`; API подменяется локальными тестовыми ответами. Подробности — в [WEB_QA.md](WEB_QA.md).
