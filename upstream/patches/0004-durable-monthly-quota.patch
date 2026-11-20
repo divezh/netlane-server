@@ -1,8 +1,7 @@
 diff --git a/AGENTS.md b/AGENTS.md
-index 3f5b8d3..4649a1e 100644
 --- a/AGENTS.md
 +++ b/AGENTS.md
-@@ -30,7 +30,8 @@ traffic.
+@@ -30,7 +30,8 @@
  vpn-libs-endpoint/
  ├── lib/                       # Core library crate (`trusttunnel`)
  │   ├── src/                   # Protocol logic, codecs, forwarders, settings
@@ -11,35 +10,33 @@ index 3f5b8d3..4649a1e 100644
 +│   │   └── usage.rs           # Durable managed quota accounting
  │   └── tests/                 # Integration tests (tunnel, auth, ping, speedtest, reverse proxy)
  │       └── common/            # Shared test helpers and fixtures
- ├── endpoint/                  # Binary crate (`trusttunnel_endpoint`)
+ ├── endpoint/                  # Binary crate (`trusttunnel_endpoint`) with `--setup-wizard`
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 3f24bfb..bab7fe4 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+@@ -5,6 +5,9 @@
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
  
  ## [Unreleased]
- 
++
 +- [Feature] Managed `quota_bytes` enforces a shared UTC monthly traffic budget
 +  with a durable usage journal, 24-month history and fail-closed crash recovery.
-+
+ 
  - [Feature] Managed `expires_at` closes expired VPN sessions and denies reconnects
    independently of the admin panel; saved policies preserve expiry across restarts.
- 
 diff --git a/endpoint/src/main.rs b/endpoint/src/main.rs
-index c5ce269..af3a8b3 100644
 --- a/endpoint/src/main.rs
 +++ b/endpoint/src/main.rs
-@@ -15,7 +15,7 @@ use trusttunnel::shutdown::Shutdown;
+@@ -15,7 +15,7 @@
  use trusttunnel::{log_utils, settings};
  mod management;
  
 -const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.3");
 +const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.4");
  const VERSION_PARAM_NAME: &str = "v_e_r_s_i_o_n_do_not_change_this_name_it_will_break";
+ const SETUP_WIZARD_PARAM_NAME: &str = "setup-wizard";
  const LOG_LEVEL_PARAM_NAME: &str = "log_level";
- const LOG_FILE_PARAM_NAME: &str = "log_file";
-@@ -545,7 +545,9 @@ fn main() {
+@@ -732,7 +732,9 @@
          let socket = args.get_one::<String>("control-socket").cloned();
          async move {
              match (management, socket) {
@@ -51,10 +48,9 @@ index c5ce269..af3a8b3 100644
              }
          }
 diff --git a/endpoint/src/management.rs b/endpoint/src/management.rs
-index 7226e95..ad625cc 100644
 --- a/endpoint/src/management.rs
 +++ b/endpoint/src/management.rs
-@@ -24,6 +24,8 @@ pub struct ManagedUser {
+@@ -24,6 +24,8 @@
      pub upload_mbps: u32,
      #[serde(default, skip_serializing_if = "Option::is_none")]
      pub expires_at: Option<String>,
@@ -63,7 +59,7 @@ index 7226e95..ad625cc 100644
      pub revision: u64,
      #[serde(default)]
      pub max_http2_conns: Option<u32>,
-@@ -34,6 +36,8 @@ pub struct ManagedUser {
+@@ -34,6 +36,8 @@
  #[serde(deny_unknown_fields)]
  pub struct State {
      pub version: u32,
@@ -72,7 +68,7 @@ index 7226e95..ad625cc 100644
      pub generation: u64,
      pub users: Vec<ManagedUser>,
  }
-@@ -41,6 +45,12 @@ pub struct State {
+@@ -41,6 +45,12 @@
  #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
  enum Request {
      Status,
@@ -85,7 +81,7 @@ index 7226e95..ad625cc 100644
      Upsert {
          expected_generation: u64,
          user: ManagedUser,
-@@ -54,6 +64,10 @@ pub struct Management {
+@@ -54,6 +64,10 @@
      path: PathBuf,
      core: Arc<Core>,
      registry: Arc<RegistryBasedAuthenticator>,
@@ -96,7 +92,7 @@ index 7226e95..ad625cc 100644
  }
  fn invalid() -> io::Error {
      io::Error::new(io::ErrorKind::InvalidData, "invalid managed state")
-@@ -92,6 +106,7 @@ impl State {
+@@ -92,6 +106,7 @@
              }
              Err(e) if e.kind() == io::ErrorKind::NotFound => Self {
                  version: 1,
@@ -104,7 +100,7 @@ index 7226e95..ad625cc 100644
                  generation: 0,
                  users: clients
                      .iter()
-@@ -103,6 +118,7 @@ impl State {
+@@ -103,6 +118,7 @@
                          download_mbps: 0,
                          upload_mbps: 0,
                          expires_at: None,
@@ -112,7 +108,7 @@ index 7226e95..ad625cc 100644
                          revision: 1,
                          max_http2_conns: c.max_http2_conns,
                          max_http3_conns: c.max_http3_conns,
-@@ -115,7 +131,7 @@ impl State {
+@@ -115,7 +131,7 @@
          Ok(state)
      }
      fn validate(&self) -> io::Result<()> {
@@ -121,7 +117,7 @@ index 7226e95..ad625cc 100644
              return Err(invalid());
          }
          let mut names = HashSet::new();
-@@ -134,6 +150,7 @@ impl State {
+@@ -134,6 +150,7 @@
                  || u.revision == 0
                  || u.download_mbps > 1000000
                  || u.upload_mbps > 1000000
@@ -129,7 +125,7 @@ index 7226e95..ad625cc 100644
                  || expiry_millis(u.expires_at.as_deref()).is_err()
                  || !names.insert(&u.username)
                  || !ids.insert(&u.id)
-@@ -165,22 +182,29 @@ impl State {
+@@ -165,22 +182,29 @@
          std::fs::File::open(parent)?.sync_all()
      }
      fn public(&self) -> serde_json::Value {
@@ -161,7 +157,7 @@ index 7226e95..ad625cc 100644
          });
          this.apply(&state)?;
          Ok(this)
-@@ -193,10 +217,12 @@ impl Management {
+@@ -193,10 +217,12 @@
                  .users
                  .iter()
                  .map(|u| TrafficPolicy {
@@ -174,7 +170,7 @@ index 7226e95..ad625cc 100644
                      expires_at_unix_ms: expiry_millis(u.expires_at.as_deref())
                          .expect("validated expiry"),
                  })
-@@ -208,7 +234,8 @@ impl Management {
+@@ -208,7 +234,8 @@
      async fn handle(&self, request: Request) -> serde_json::Value {
          let mut state = self.state.lock().await;
          match request {
@@ -184,7 +180,7 @@ index 7226e95..ad625cc 100644
              Request::Disconnect { username } => {
                  if !state.users.iter().any(|u| u.username == username) {
                      return serde_json::json!({"ok":false,"error":"user_not_found"});
-@@ -235,7 +262,7 @@ impl Management {
+@@ -235,7 +262,7 @@
                          if state.persist(&self.path).is_err() {
                              return serde_json::json!({"ok":false,"error":"state_write_failed"});
                          }
@@ -193,11 +189,12 @@ index 7226e95..ad625cc 100644
                      }
                      *old = user;
                  } else {
-@@ -285,8 +312,85 @@ impl Management {
+@@ -285,8 +312,85 @@
                  if !durable {
                      return serde_json::json!({"ok":false,"error":"state_durability_uncertain"});
                  }
 -                serde_json::json!({"ok":true,"state":state.public()})
+-            }
 +                self.reply(&state)
 +            }
 +        }
@@ -221,7 +218,7 @@ index 7226e95..ad625cc 100644
 +                    u["quota_exhausted"] = serde_json::json!(exhausted);
 +                }
 +                serde_json::json!({"ok":true,"state":public})
-             }
++            }
 +            Err(_) => serde_json::json!({"ok":false,"error":"usage_unavailable"}),
 +        }
 +    }
@@ -280,7 +277,7 @@ index 7226e95..ad625cc 100644
          }
      }
      pub async fn serve(self: Arc<Self>, path: PathBuf) -> io::Result<()> {
-@@ -335,6 +439,12 @@ impl Management {
+@@ -335,6 +439,12 @@
                          }
                      };
                      let mut bytes = serde_json::to_vec(&response).map_err(|_| invalid())?;
@@ -293,10 +290,11 @@ index 7226e95..ad625cc 100644
                      bytes.push(b'\n');
                      write.write_all(&bytes).await?;
                      Ok::<_, io::Error>(())
-@@ -362,6 +472,41 @@ impl Drop for SocketGuard {
+@@ -361,6 +471,41 @@
+ #[cfg(test)]
  mod tests {
      use super::*;
-     #[test]
++    #[test]
 +    fn largest_status_stays_within_rpc_response_bound() {
 +        let state = State {
 +            version: 1,
@@ -331,11 +329,10 @@ index 7226e95..ad625cc 100644
 +                < 65536
 +        );
 +    }
-+    #[test]
+     #[test]
      fn expiry_parsing_rejects_bad_dates_and_preserves_offsets() {
          assert_eq!(expiry_millis(None).unwrap(), None);
-         assert_eq!(
-@@ -379,6 +524,7 @@ mod tests {
+@@ -379,6 +524,7 @@
          let path = dir.path().join("state.json");
          let s = State {
              version: 1,
@@ -343,7 +340,7 @@ index 7226e95..ad625cc 100644
              generation: 3,
              users: vec![ManagedUser {
                  id: "u1".into(),
-@@ -388,6 +534,7 @@ mod tests {
+@@ -388,6 +534,7 @@
                  download_mbps: 2,
                  upload_mbps: 1,
                  expires_at: Some("2030-01-01T00:00:00Z".into()),
@@ -352,10 +349,9 @@ index 7226e95..ad625cc 100644
                  max_http2_conns: None,
                  max_http3_conns: None,
 diff --git a/lib/Cargo.toml b/lib/Cargo.toml
-index ebf4377..ff7b976 100644
 --- a/lib/Cargo.toml
 +++ b/lib/Cargo.toml
-@@ -39,6 +39,7 @@ rustls-native-certs = "0.7"
+@@ -39,6 +39,7 @@
  rustls-pki-types = "1.13.2"
  serde = "1.0.164"
  serde_json = "1.0"
@@ -364,10 +360,9 @@ index ebf4377..ff7b976 100644
  socket2 = "0.5"
  tokio = { version = "1.42", features = ["net", "rt", "sync", "time", "macros", "rt-multi-thread"] }
 diff --git a/lib/src/datagram_pipe.rs b/lib/src/datagram_pipe.rs
-index c3d3a97..7e35a6f 100644
 --- a/lib/src/datagram_pipe.rs
 +++ b/lib/src/datagram_pipe.rs
-@@ -142,11 +142,16 @@ impl<D: Datagram + Debug, F: Fn(pipe::SimplexDirection, usize) + Send> GenericSi
+@@ -142,11 +142,16 @@
              );
  
              let datagram_len = datagram.len();
@@ -388,19 +383,17 @@ index c3d3a97..7e35a6f 100644
                  }
                  SendStatus::Dropped => log_id!(
 diff --git a/lib/src/lib.rs b/lib/src/lib.rs
-index d37dc8b..02e49f5 100644
 --- a/lib/src/lib.rs
 +++ b/lib/src/lib.rs
-@@ -47,3 +47,4 @@ mod tls_listener;
+@@ -49,3 +49,4 @@
  mod tunnel;
  mod udp_forwarder;
  mod udp_pipe;
 +pub mod usage;
 diff --git a/lib/src/pipe.rs b/lib/src/pipe.rs
-index 073bcd7..e562e0e 100644
 --- a/lib/src/pipe.rs
 +++ b/lib/src/pipe.rs
-@@ -182,16 +182,18 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
+@@ -184,16 +184,18 @@
              match data {
                  Data::Chunk(bytes) => {
                      let data_len = bytes.len();
@@ -426,17 +419,17 @@ index 073bcd7..e562e0e 100644
                      let unsent_data = self
                          .sink
                          .write(bytes.slice(..granted))
-@@ -200,6 +202,9 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
+@@ -201,6 +203,9 @@
+                     let sent = granted - unsent_data.len();
                      if let Some(control) = &self.control {
                          control.refund(self.direction, granted - sent);
-                     }
++                    }
 +                    if let Some(permit) = permit {
 +                        permit.commit(sent);
-+                    }
+                     }
                      (self.update_metrics)(self.direction, sent);
                      self.source
-                         .consume(sent)
-@@ -362,11 +367,13 @@ mod managed_tests {
+@@ -364,11 +369,13 @@
      async fn partial_writes_are_not_charged_repeatedly() {
          let control = Arc::new(crate::traffic_control::TrafficControl::default());
          control.replace(&[crate::traffic_control::TrafficPolicy {
@@ -451,10 +444,9 @@ index 073bcd7..e562e0e 100644
          let session = control.session();
          let user = session.bind("alice").unwrap().unwrap();
 diff --git a/lib/src/traffic_control.rs b/lib/src/traffic_control.rs
-index 6e0cbe2..74056c6 100644
 --- a/lib/src/traffic_control.rs
 +++ b/lib/src/traffic_control.rs
-@@ -11,12 +11,15 @@ use tokio::time::{Duration, Instant};
+@@ -11,12 +11,15 @@
  #[derive(Clone, Serialize, Deserialize)]
  #[serde(deny_unknown_fields)]
  pub struct TrafficPolicy {
@@ -470,7 +462,7 @@ index 6e0cbe2..74056c6 100644
  }
  
  struct Expiry {
-@@ -60,6 +63,20 @@ pub(crate) struct UserControl {
+@@ -60,6 +63,20 @@
      upload: Mutex<Bucket>,
      changed: watch::Sender<u64>,
      expiry: Mutex<Expiry>,
@@ -491,7 +483,7 @@ index 6e0cbe2..74056c6 100644
  }
  impl UserControl {
      fn active_at(&self, now: i64) -> bool {
-@@ -69,6 +86,10 @@ impl UserControl {
+@@ -69,6 +86,10 @@
      }
      fn active(&self) -> bool {
          self.active_at(chrono::Utc::now().timestamp_millis())
@@ -502,7 +494,7 @@ index 6e0cbe2..74056c6 100644
      }
      async fn unavailable(&self) {
          let mut changed = self.changed.subscribe();
-@@ -78,8 +99,10 @@ impl UserControl {
+@@ -78,8 +99,10 @@
                  return;
              }
              let at = self.expiry.lock().unwrap().at;
@@ -515,7 +507,7 @@ index 6e0cbe2..74056c6 100644
                  let delay = Duration::from_millis(remaining.clamp(1, 1000) as u64);
                  tokio::select! { _ = tokio::time::sleep(delay) => {}, _ = changed.changed() => {} }
              } else if changed.changed().await.is_err() {
-@@ -95,7 +118,7 @@ impl UserControl {
+@@ -95,7 +118,7 @@
          b.refill();
          b.tokens = (b.tokens + bytes as f64).min(Bucket::capacity(b.rate));
      }
@@ -524,7 +516,7 @@ index 6e0cbe2..74056c6 100644
          Self {
              enabled: AtomicBool::new(p.enabled),
              download: Mutex::new(Bucket::new(p.download_mbps)),
-@@ -105,6 +128,9 @@ impl UserControl {
+@@ -105,6 +128,9 @@
                  at: p.expires_at_unix_ms,
                  elapsed: false,
              }),
@@ -534,7 +526,7 @@ index 6e0cbe2..74056c6 100644
          }
      }
      fn update(&self, p: &TrafficPolicy) {
-@@ -120,6 +146,7 @@ impl UserControl {
+@@ -120,6 +146,7 @@
          self.download.lock().unwrap().update(p.download_mbps);
          self.upload.lock().unwrap().update(p.upload_mbps);
          self.enabled.store(p.enabled, Ordering::Release);
@@ -542,7 +534,7 @@ index 6e0cbe2..74056c6 100644
          self.changed.send_modify(|n| *n = n.wrapping_add(1));
      }
      pub(crate) async fn acquire(
-@@ -162,6 +189,57 @@ impl UserControl {
+@@ -162,6 +189,57 @@
          }
          Ok(())
      }
@@ -600,7 +592,7 @@ index 6e0cbe2..74056c6 100644
  }
  
  #[derive(Default)]
-@@ -169,6 +247,7 @@ pub struct TrafficControl {
+@@ -169,6 +247,7 @@
      policies: RwLock<Option<HashMap<String, Arc<UserControl>>>>,
      sessions: Mutex<HashMap<u64, Weak<ManagedSession>>>,
      next: AtomicU64,
@@ -608,7 +600,7 @@ index 6e0cbe2..74056c6 100644
  }
  pub(crate) struct ManagedSession {
      id: u64,
-@@ -233,15 +312,23 @@ impl ManagedSession {
+@@ -233,15 +312,23 @@
      }
  }
  impl TrafficControl {
@@ -636,7 +628,7 @@ index 6e0cbe2..74056c6 100644
              user.update(p);
              next.insert(p.username.clone(), user);
          }
-@@ -309,18 +396,20 @@ mod tests {
+@@ -309,18 +396,20 @@
      use super::*;
      fn policy(name: &str) -> TrafficPolicy {
          TrafficPolicy {
@@ -659,10 +651,9 @@ index 6e0cbe2..74056c6 100644
          assert!(!user.active_at(2000));
          assert!(!user.active_at(1000));
 diff --git a/lib/src/udp_pipe.rs b/lib/src/udp_pipe.rs
-index 91277e0..81835b5 100644
 --- a/lib/src/udp_pipe.rs
 +++ b/lib/src/udp_pipe.rs
-@@ -73,11 +73,16 @@ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> LeftPipe<F> {
+@@ -73,11 +73,16 @@
              }
  
              let datagram_len = datagram.payload.len();
@@ -682,7 +673,7 @@ index 91277e0..81835b5 100644
                      (self.shared.update_metrics)(self.direction, datagram_len);
                  }
                  datagram_pipe::SendStatus::Dropped => {
-@@ -152,11 +157,16 @@ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> RightPipe<F> {
+@@ -152,11 +157,16 @@
  
              let meta = datagram.meta;
              let datagram_len = datagram.payload.len();
@@ -704,7 +695,6 @@ index 91277e0..81835b5 100644
                  datagram_pipe::SendStatus::Dropped => {
 diff --git a/lib/src/usage.rs b/lib/src/usage.rs
 new file mode 100644
-index 0000000..cff56df
 --- /dev/null
 +++ b/lib/src/usage.rs
 @@ -0,0 +1,695 @@
@@ -1404,10 +1394,9 @@ index 0000000..cff56df
 +    }
 +}
 diff --git a/lib/tests/managed.rs b/lib/tests/managed.rs
-index f4caf6d..68ec3ef 100644
 --- a/lib/tests/managed.rs
 +++ b/lib/tests/managed.rs
-@@ -98,6 +98,12 @@ async fn transfer(
+@@ -98,6 +98,12 @@
  }
  
  fn make_endpoint() -> (SocketAddr, common::File, Arc<Core>) {
@@ -1420,7 +1409,7 @@ index f4caf6d..68ec3ef 100644
      let endpoint = common::make_endpoint_address();
      let cert = common::make_cert_key_file();
      let cert_path = cert.path.to_str().unwrap().to_string();
-@@ -134,8 +140,13 @@ fn make_endpoint() -> (SocketAddr, common::File, Arc<Core>) {
+@@ -134,8 +140,13 @@
          .build()
          .unwrap();
      let core = Arc::new(Core::new(settings, Some(registry), hosts, Shutdown::new()).unwrap());
@@ -1434,7 +1423,7 @@ index f4caf6d..68ec3ef 100644
              username: "alice".into(),
              enabled: true,
              download_mbps: 2,
-@@ -143,6 +154,8 @@ fn make_endpoint() -> (SocketAddr, common::File, Arc<Core>) {
+@@ -143,6 +154,8 @@
              expires_at_unix_ms: None,
          },
          TrafficPolicy {
@@ -1443,7 +1432,7 @@ index f4caf6d..68ec3ef 100644
              username: "bob".into(),
              enabled: true,
              download_mbps: 0,
-@@ -273,6 +286,8 @@ fn close_alice(core: &Core, expiry: bool) {
+@@ -273,6 +286,8 @@
      if expiry {
          core.traffic_control().replace(&[
              TrafficPolicy {
@@ -1452,7 +1441,7 @@ index f4caf6d..68ec3ef 100644
                  username: "alice".into(),
                  enabled: true,
                  download_mbps: 0,
-@@ -280,6 +295,8 @@ fn close_alice(core: &Core, expiry: bool) {
+@@ -280,6 +295,8 @@
                  expires_at_unix_ms: Some(chrono::Utc::now().timestamp_millis() + 250),
              },
              TrafficPolicy {
@@ -1461,7 +1450,7 @@ index f4caf6d..68ec3ef 100644
                  username: "bob".into(),
                  enabled: true,
                  download_mbps: 0,
-@@ -379,9 +396,18 @@ async fn h3_expiry_closes_idle_transport_without_interrupting_bob() {
+@@ -379,9 +396,18 @@
      Box::pin(targeted_kick(true, true)).await;
  }
  
@@ -1482,7 +1471,7 @@ index f4caf6d..68ec3ef 100644
      let server = tokio::spawn({
          let core = core.clone();
          async move { core.listen().await.unwrap() }
-@@ -428,7 +454,9 @@ async fn udp_expiry(h3: bool) {
+@@ -428,7 +454,9 @@
                  received.extend_from_slice(&chunk[..n]);
              }
              assert!(received.ends_with(b"ok"));
@@ -1493,7 +1482,7 @@ index f4caf6d..68ec3ef 100644
              tokio::time::timeout(Duration::from_secs(3), alice.wait_for_peer_close())
                  .await
                  .unwrap();
-@@ -438,7 +466,9 @@ async fn udp_expiry(h3: bool) {
+@@ -438,7 +466,9 @@
              let mut ack = [0u8; 42];
              alice.read_exact(&mut ack).await.unwrap();
              assert!(ack.ends_with(b"ok"));
@@ -1504,7 +1493,7 @@ index f4caf6d..68ec3ef 100644
              let result = tokio::time::timeout(Duration::from_secs(3), alice.read(&mut ack))
                  .await
                  .unwrap();
-@@ -449,15 +479,98 @@ async fn udp_expiry(h3: bool) {
+@@ -449,15 +479,98 @@
      tokio::time::timeout(Duration::from_secs(5), Box::pin(work))
          .await
          .unwrap();
@@ -1532,6 +1521,7 @@ index f4caf6d..68ec3ef 100644
  #[tokio::test]
  async fn h3_expiry_closes_udp_mux_after_real_datagram() {
 -    Box::pin(udp_expiry(true)).await;
+-}
 +    Box::pin(udp_expiry(true, false)).await;
 +}
 +#[tokio::test]
@@ -1604,4 +1594,4 @@ index f4caf6d..68ec3ef 100644
 +#[tokio::test]
 +async fn h3_parallel_transports_share_durable_quota() {
 +    Box::pin(shared_quota(true)).await;
- }
++}

@@ -1,8 +1,7 @@
 diff --git a/endpoint/src/management.rs b/endpoint/src/management.rs
-index 2f24a4c..a2bfa94 100644
 --- a/endpoint/src/management.rs
 +++ b/endpoint/src/management.rs
-@@ -40,6 +40,16 @@ pub struct State {
+@@ -40,6 +40,16 @@
      pub usage_version: u32,
      pub generation: u64,
      pub users: Vec<ManagedUser>,
@@ -19,7 +18,7 @@ index 2f24a4c..a2bfa94 100644
  }
  #[derive(Deserialize)]
  #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-@@ -64,6 +74,9 @@ enum Request {
+@@ -64,6 +74,9 @@
      Disconnect {
          username: String,
      },
@@ -29,7 +28,7 @@ index 2f24a4c..a2bfa94 100644
  }
  pub struct Management {
      state: Mutex<State>,
-@@ -145,6 +158,7 @@ impl State {
+@@ -145,6 +158,7 @@
                  version: 1,
                  usage_version: 0,
                  generation: 0,
@@ -37,7 +36,7 @@ index 2f24a4c..a2bfa94 100644
                  users: clients
                      .iter()
                      .map(|c| ManagedUser {
-@@ -219,7 +233,7 @@ impl State {
+@@ -219,7 +233,7 @@
          std::fs::File::open(parent)?.sync_all()
      }
      fn public(&self) -> serde_json::Value {
@@ -46,7 +45,7 @@ index 2f24a4c..a2bfa94 100644
      }
  }
  impl Management {
-@@ -247,6 +261,7 @@ impl Management {
+@@ -247,6 +261,7 @@
          Ok(this)
      }
      fn apply(&self, state: &State) -> io::Result<()> {
@@ -54,10 +53,12 @@ index 2f24a4c..a2bfa94 100644
          let clients = state.clients();
          RegistryBasedAuthenticator::validate_clients(&clients)?;
          self.core.traffic_control().replace(
-@@ -305,6 +320,16 @@ impl Management {
+@@ -303,6 +318,16 @@
+                 if !durable {
+                     return serde_json::json!({"ok":false,"error":"state_durability_uncertain"});
                  }
-                 self.reply(&state)
-             }
++                self.reply(&state)
++            }
 +            Request::Policy { block_bittorrent } => {
 +                let mut next = state.clone();
 +                next.block_bittorrent = block_bittorrent;
@@ -66,12 +67,10 @@ index 2f24a4c..a2bfa94 100644
 +                }
 +                trusttunnel::p2p_filter::set_enabled(block_bittorrent);
 +                *state = next;
-+                self.reply(&state)
-+            }
+                 self.reply(&state)
+             }
              Request::Disconnect { username } => {
-                 if !state.users.iter().any(|u| u.username == username) {
-                     return serde_json::json!({"ok":false,"error":"user_not_found"});
-@@ -547,6 +572,7 @@ mod tests {
+@@ -547,6 +572,7 @@
          let path = dir.path().join("state.json");
          let mut state = State {
              version: 1,
@@ -79,7 +78,7 @@ index 2f24a4c..a2bfa94 100644
              usage_version: 1,
              generation: 3,
              users: vec![ManagedUser {
-@@ -597,6 +623,7 @@ mod tests {
+@@ -597,6 +623,7 @@
      fn largest_status_stays_within_rpc_response_bound() {
          let state = State {
              version: 1,
@@ -87,7 +86,7 @@ index 2f24a4c..a2bfa94 100644
              usage_version: 1,
              generation: u64::MAX,
              users: (0..100)
-@@ -646,6 +673,7 @@ mod tests {
+@@ -646,6 +673,7 @@
          let path = dir.path().join("state.json");
          let s = State {
              version: 1,
@@ -95,10 +94,11 @@ index 2f24a4c..a2bfa94 100644
              usage_version: 0,
              generation: 3,
              users: vec![ManagedUser {
-@@ -676,4 +704,22 @@ mod tests {
+@@ -676,4 +704,22 @@
          std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
          assert!(State::load_or_import(&path, &[]).is_err());
      }
+-}
 +
 +    #[test]
 +    fn bittorrent_policy_is_written_only_when_off() {
@@ -117,12 +117,11 @@ index 2f24a4c..a2bfa94 100644
 +        let back: State = serde_json::from_str(&text).unwrap();
 +        assert!(!back.block_bittorrent);
 +    }
- }
++}
 diff --git a/lib/src/lib.rs b/lib/src/lib.rs
-index 02e49f5..26b20f6 100644
 --- a/lib/src/lib.rs
 +++ b/lib/src/lib.rs
-@@ -10,6 +10,7 @@ pub mod client_random_prefix;
+@@ -10,6 +10,7 @@
  pub mod core;
  pub mod log_utils;
  pub mod net_utils;
@@ -132,7 +131,6 @@ index 02e49f5..26b20f6 100644
  pub mod shutdown;
 diff --git a/lib/src/p2p_filter.rs b/lib/src/p2p_filter.rs
 new file mode 100644
-index 0000000..2212afb
 --- /dev/null
 +++ b/lib/src/p2p_filter.rs
 @@ -0,0 +1,165 @@
@@ -302,10 +300,9 @@ index 0000000..2212afb
 +    }
 +}
 diff --git a/lib/src/pipe.rs b/lib/src/pipe.rs
-index e562e0e..e5ea134 100644
 --- a/lib/src/pipe.rs
 +++ b/lib/src/pipe.rs
-@@ -93,6 +93,8 @@ pub(crate) struct SimplexPipe<F> {
+@@ -95,6 +95,8 @@
      direction: SimplexDirection,
      last_activity: Instant,
      control: Option<std::sync::Arc<crate::traffic_control::UserControl>>,
@@ -314,7 +311,7 @@ index e562e0e..e5ea134 100644
  }
  
  pub(crate) struct Error<T> {
-@@ -138,6 +140,7 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
+@@ -140,6 +142,7 @@
              direction,
              last_activity: Instant::now(),
              control: None,
@@ -322,7 +319,7 @@ index e562e0e..e5ea134 100644
          }
      }
  
-@@ -149,6 +152,7 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
+@@ -151,6 +154,7 @@
      ) -> Result<ExchangeOnceStatus<T>, Error<T>> {
          loop {
              self.last_activity = Instant::now();
@@ -330,7 +327,7 @@ index e562e0e..e5ea134 100644
  
              let future = async {
                  self.sink.flush().await?;
-@@ -181,6 +185,38 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
+@@ -183,6 +187,38 @@
  
              match data {
                  Data::Chunk(bytes) => {
@@ -369,10 +366,12 @@ index e562e0e..e5ea134 100644
                      let data_len = bytes.len();
                      let permit = if let Some(control) = &self.control {
                          let n = data_len.min(16384);
-@@ -248,6 +284,17 @@ impl<F: Fn(SimplexDirection, usize) + Send + Clone> DuplexPipe<F> {
+@@ -248,6 +284,17 @@
+     ) -> Self {
+         self.left_pipe.control = control.clone();
          self.right_pipe.control = control;
-         self
-     }
++        self
++    }
 +    /// Checks what the client sends first for BitTorrent when blocking is on (crate::p2p_filter).
 +    pub(crate) fn with_p2p_filter(mut self) -> Self {
 +        if crate::p2p_filter::enabled() {
@@ -382,15 +381,14 @@ index e562e0e..e5ea134 100644
 +                }
 +            }
 +        }
-+        self
-+    }
+         self
+     }
      pub fn new(
-         (dir1, source1, sink1): (SimplexDirection, Box<dyn Source>, Box<dyn Sink>),
-         (dir2, source2, sink2): (SimplexDirection, Box<dyn Source>, Box<dyn Sink>),
-@@ -393,4 +440,26 @@ mod managed_tests {
+@@ -395,4 +442,26 @@
          assert_eq!(consumed.load(Ordering::Relaxed), 65536);
          assert_eq!(Instant::now(), start);
      }
+-}
 +
 +    #[tokio::test]
 +    async fn bittorrent_handshake_closes_the_stream() {
@@ -413,12 +411,11 @@ index e562e0e..e5ea134 100644
 +        };
 +        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
 +    }
- }
++}
 diff --git a/lib/src/tunnel.rs b/lib/src/tunnel.rs
-index 213db12..abcac30 100644
 --- a/lib/src/tunnel.rs
 +++ b/lib/src/tunnel.rs
-@@ -496,7 +496,8 @@ impl Tunnel {
+@@ -496,7 +496,8 @@
              (pipe::SimplexDirection::Incoming, fwd_rx, dstr_tx),
              update_metrics,
          )
@@ -429,13 +426,13 @@ index 213db12..abcac30 100644
          log_id!(trace, request_id, "TCP connect: pipe exchange started");
          match pipe
 diff --git a/lib/src/udp_pipe.rs b/lib/src/udp_pipe.rs
-index 81835b5..ab95dd1 100644
 --- a/lib/src/udp_pipe.rs
 +++ b/lib/src/udp_pipe.rs
-@@ -61,6 +61,14 @@ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> LeftPipe<F> {
+@@ -60,6 +60,14 @@
+         loop {
              let datagram = self.source.read().await?;
              log_id!(trace, self.source.id(), "--> Datagram: {:?}", datagram);
- 
++
 +            if crate::p2p_filter::enabled()
 +                && crate::p2p_filter::inspect_datagram(&datagram.payload)
 +            {
@@ -443,7 +440,6 @@ index 81835b5..ab95dd1 100644
 +                log_id!(debug, self.source.id(), "--> BitTorrent datagram dropped");
 +                continue;
 +            }
-+
+ 
              if let Err(e) = self.on_udp_packet(&datagram.meta).await {
                  log_id!(
-                     debug,

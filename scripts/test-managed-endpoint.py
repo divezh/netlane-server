@@ -66,9 +66,10 @@ with tempfile.TemporaryDirectory(prefix="tt-managed-") as temporary:
         f'cert_chain_path={json.dumps(str(root / "cert.pem"))}\nprivate_key_path={json.dumps(str(root / "key.pem"))}\n')
 
     def start_endpoint():
-        process = subprocess.Popen([endpoint, str(root / "vpn.toml"), str(root / "hosts.toml"),
-                                    "--control-socket", str(socket_path), "--control-state", str(state_path)],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with (root / "endpoint.log").open("ab", buffering=0) as log:
+            process = subprocess.Popen([endpoint, str(root / "vpn.toml"), str(root / "hosts.toml"),
+                                        "--control-socket", str(socket_path), "--control-state", str(state_path)],
+                                       stdout=log, stderr=subprocess.STDOUT)
         return process
 
     def rpc(request):
@@ -210,6 +211,20 @@ with tempfile.TemporaryDirectory(prefix="tt-managed-") as temporary:
         alice, bob = connect("alice"), connect("bob")
         echo_ok(alice)
         echo_ok(bob)
+        # SIGHUP now also reloads upstream subscriptions. Invalid disk input must
+        # retain active tunnels; valid input must not overwrite managed credentials.
+        vpn_settings = (root / "vpn.toml").read_text()
+        (root / "vpn.toml").write_text('invalid = [')
+        endpoint_process.send_signal(signal.SIGHUP)
+        def log_contains(message):
+            assert message in (root / "endpoint.log").read_text(), message
+        eventually(lambda: log_contains("Reload rejected: invalid or unreadable configuration"))
+        assert endpoint_process.poll() is None
+        echo_ok(bob)
+        (root / "vpn.toml").write_text(vpn_settings)
+        endpoint_process.send_signal(signal.SIGHUP)
+        eventually(lambda: log_contains("Subscription settings are successfully reloaded"))
+        echo_ok(connect("bob"))
         assert api("POST", f'/api/v1/users/{users["alice"]["id"]}/disconnect', {})["disconnect_requested"] == 1
         closed(alice)
         echo_ok(bob)

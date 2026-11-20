@@ -1,47 +1,43 @@
 diff --git a/Cargo.lock b/Cargo.lock
-index 620b04d..a35cb1f 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -3575,6 +3575,9 @@ dependencies = [
-  "nix 0.28.0",
+@@ -3649,6 +3649,8 @@
   "rustls",
   "sentry",
-+ "serde",
+  "serde",
 + "serde_json",
 + "tempfile",
   "tokio",
   "toml",
   "toml_edit 0.19.15",
 diff --git a/endpoint/Cargo.toml b/endpoint/Cargo.toml
-index a1605e5..83dd5b1 100644
 --- a/endpoint/Cargo.toml
 +++ b/endpoint/Cargo.toml
-@@ -8,6 +8,9 @@ name = "trusttunnel_endpoint"
+@@ -8,6 +8,8 @@
  doctest = false
  
  [dependencies]
-+serde = { version = "1", features = ["derive"] }
 +serde_json = "1"
 +tempfile = "3"
  clap = "4.5"
  console-subscriber = { version = "0.1.9", optional = true }
  hex = "0.4"
 diff --git a/endpoint/src/main.rs b/endpoint/src/main.rs
-index 9d7b365..3da32fb 100644
 --- a/endpoint/src/main.rs
 +++ b/endpoint/src/main.rs
-@@ -13,8 +13,9 @@ use trusttunnel::core::Core;
+@@ -13,8 +13,9 @@
  use trusttunnel::settings::Settings;
  use trusttunnel::shutdown::Shutdown;
  use trusttunnel::{log_utils, settings};
-+mod management;
- 
+-
 -const VERSION_STRING: &str = env!("TRUSTTUNNEL_VERSION");
++mod management;
++
 +const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.2");
  const VERSION_PARAM_NAME: &str = "v_e_r_s_i_o_n_do_not_change_this_name_it_will_break";
+ const SETUP_WIZARD_PARAM_NAME: &str = "setup-wizard";
  const LOG_LEVEL_PARAM_NAME: &str = "log_level";
- const LOG_FILE_PARAM_NAME: &str = "log_file";
-@@ -178,6 +179,12 @@ fn main() {
+@@ -212,6 +213,12 @@
                  .short('n')
                  .long("name")
                  .help("Human-readable server display name for the client configuration."),
@@ -54,7 +50,7 @@ index 9d7b365..3da32fb 100644
              clap::Arg::new(DNS_UPSTREAM_PARAM_NAME)
                  .action(clap::ArgAction::Append)
                  .requires(CLIENT_CONFIG_PARAM_NAME)
-@@ -514,6 +521,35 @@ fn main() {
+@@ -701,6 +708,35 @@
          )
          .expect("Couldn't create core instance"),
      );
@@ -90,32 +86,32 @@ index 9d7b365..3da32fb 100644
  
      let listen_task = {
          let core = core.clone();
-@@ -525,6 +561,7 @@ fn main() {
-         let tls_hosts_settings_path = tls_hosts_settings_path.clone();
-         let settings_path = settings_path.clone();
+@@ -710,6 +746,7 @@
+     let reload_tls_hosts_task = {
+         let core = core.clone();
          let registry = registry.clone();
 +        let managed = management.is_some();
+         let tls_hosts_settings_path = tls_hosts_settings_path.clone();
+         let settings_path = settings_path.clone();
          async move {
-             let mut sighup_listener = signal::unix::signal(signal::unix::SignalKind::hangup())
-                 .expect("Couldn't start SIGHUP listener");
-@@ -548,14 +585,14 @@ fn main() {
-                             error!("TLS reload rejected: {}; previous configuration retained", e);
-                             continue;
-                         }
--                        if let Some(registry) = &registry {
-+                        if let Some(registry) = registry.as_ref().filter(|_|!managed) {
-                             core.reload_client_limits(settings.get_clients());
-                             if let Err(e) = registry.replace_clients(settings.get_clients()) {
-                                 error!("Credentials reload rejected: {}", e);
-                                 continue;
-                             }
-                         }
--                        info!("TLS hosts and client credentials reloaded; existing streams retained");
-+                        info!("TLS hosts reloaded; managed credentials are controlled only by the local socket");
-                     }
-                     Err(_) => error!("Reload rejected: invalid or unreadable configuration; previous state retained"),
+@@ -742,14 +779,14 @@
+                     );
+                     continue;
                  }
-@@ -572,6 +609,10 @@ fn main() {
+-                if let Some(registry) = &registry {
++                if let Some(registry) = registry.as_ref().filter(|_| !managed) {
+                     core.reload_client_limits(settings.get_clients());
+                     if let Err(e) = registry.replace_clients(settings.get_clients()) {
+                         error!("Credentials reload rejected: {}", e);
+                         continue;
+                     }
+                 }
+-                info!("TLS hosts and client credentials reloaded; existing streams retained");
++                info!("TLS hosts reloaded; managed credentials are controlled only by the local socket");
+ 
+                 info!("Reloading subscription settings");
+                 let subscription = std::fs::read_to_string(&settings_path).and_then(|contents| {
+@@ -790,6 +827,10 @@
  
      let exit_code = rt.block_on(async move {
          tokio::select! {
@@ -128,7 +124,6 @@ index 9d7b365..3da32fb 100644
                  Err(e) => {
 diff --git a/endpoint/src/management.rs b/endpoint/src/management.rs
 new file mode 100644
-index 0000000..9374eb5
 --- /dev/null
 +++ b/endpoint/src/management.rs
 @@ -0,0 +1,379 @@
@@ -512,10 +507,9 @@ index 0000000..9374eb5
 +    }
 +}
 diff --git a/lib/Cargo.toml b/lib/Cargo.toml
-index a88a0db..ebf4377 100644
 --- a/lib/Cargo.toml
 +++ b/lib/Cargo.toml
-@@ -48,6 +48,7 @@ boring = "4"
+@@ -48,6 +48,7 @@
  trusttunnel-deeplink = { path = "../deeplink" }
  
  [dev-dependencies]
@@ -524,10 +518,9 @@ index a88a0db..ebf4377 100644
  rustls = { version = "0.23.37", features = ["logging"] }
  tempfile = "3"
 diff --git a/lib/src/core.rs b/lib/src/core.rs
-index 9b54ce0..1b98ca0 100644
 --- a/lib/src/core.rs
 +++ b/lib/src/core.rs
-@@ -83,6 +83,7 @@ pub(crate) struct Context {
+@@ -85,6 +85,7 @@
      next_client_id: Arc<AtomicU64>,
      next_tunnel_id: Arc<AtomicU64>,
      pub connection_limiter: Option<Arc<ConnectionLimiter>>,
@@ -535,7 +528,7 @@ index 9b54ce0..1b98ca0 100644
  }
  
  impl Context {
-@@ -161,6 +162,7 @@ impl Core {
+@@ -171,6 +172,7 @@
                  next_client_id: Default::default(),
                  next_tunnel_id: Default::default(),
                  connection_limiter,
@@ -543,18 +536,18 @@ index 9b54ce0..1b98ca0 100644
              }),
          })
      }
-@@ -223,6 +225,10 @@ impl Core {
+@@ -231,6 +233,10 @@
+                 listen_metrics,
+             ) => x.map(|_| ()),
          }
-     }
- 
-+    pub fn traffic_control(&self) -> Arc<crate::traffic_control::TrafficControl> {
-+        self.context.traffic_control.clone()
 +    }
 +
++    pub fn traffic_control(&self) -> Arc<crate::traffic_control::TrafficControl> {
++        self.context.traffic_control.clone()
+     }
+ 
      /// Update admission limits without dropping active guards or sessions.
-     pub fn reload_client_limits(&self, clients: &[authentication::registry_based::Client]) {
-         if let Some(limiter) = &self.context.connection_limiter {
-@@ -822,6 +828,7 @@ impl Default for Context {
+@@ -868,6 +874,7 @@
              next_client_id: Default::default(),
              next_tunnel_id: Default::default(),
              connection_limiter: None,
@@ -563,10 +556,9 @@ index 9b54ce0..1b98ca0 100644
      }
  }
 diff --git a/lib/src/datagram_pipe.rs b/lib/src/datagram_pipe.rs
-index cf332a1..c3d3a97 100644
 --- a/lib/src/datagram_pipe.rs
 +++ b/lib/src/datagram_pipe.rs
-@@ -49,6 +49,7 @@ pub(crate) trait DuplexPipe: Send {
+@@ -49,6 +49,7 @@
  }
  
  pub(crate) struct GenericSimplexPipe<D, F> {
@@ -574,7 +566,7 @@ index cf332a1..c3d3a97 100644
      direction: pipe::SimplexDirection,
      source: Box<dyn Source<Output = D>>,
      sink: Box<dyn Sink<Input = D>>,
-@@ -66,6 +67,14 @@ where
+@@ -66,6 +67,14 @@
      D2: Datagram + Debug,
      F: Fn(pipe::SimplexDirection, usize) + Send + Clone,
  {
@@ -589,7 +581,7 @@ index cf332a1..c3d3a97 100644
      pub fn new(
          (dir1, source1, sink1): (
              pipe::SimplexDirection,
-@@ -114,6 +123,7 @@ impl<D: Datagram + Debug, F: Fn(pipe::SimplexDirection, usize) + Send> GenericSi
+@@ -114,6 +123,7 @@
      ) -> Self {
          Self {
              direction,
@@ -597,7 +589,7 @@ index cf332a1..c3d3a97 100644
              source,
              sink,
              update_metrics,
-@@ -132,6 +142,9 @@ impl<D: Datagram + Debug, F: Fn(pipe::SimplexDirection, usize) + Send> GenericSi
+@@ -132,6 +142,9 @@
              );
  
              let datagram_len = datagram.len();
@@ -608,22 +600,20 @@ index cf332a1..c3d3a97 100644
                  SendStatus::Sent => {
                      (self.update_metrics)(self.direction, datagram_len);
 diff --git a/lib/src/lib.rs b/lib/src/lib.rs
-index 0995e67..d37dc8b 100644
 --- a/lib/src/lib.rs
 +++ b/lib/src/lib.rs
-@@ -13,6 +13,7 @@ pub mod net_utils;
- pub mod rules;
+@@ -14,6 +14,7 @@
  pub mod settings;
  pub mod shutdown;
+ pub mod subscription;
 +pub mod traffic_control;
  pub mod utils;
  
  mod connection_limiter;
 diff --git a/lib/src/pipe.rs b/lib/src/pipe.rs
-index 843803c..df89393 100644
 --- a/lib/src/pipe.rs
 +++ b/lib/src/pipe.rs
-@@ -92,6 +92,7 @@ pub(crate) struct SimplexPipe<F> {
+@@ -94,6 +94,7 @@
      pending_chunk: Option<Data>,
      direction: SimplexDirection,
      last_activity: Instant,
@@ -631,7 +621,7 @@ index 843803c..df89393 100644
  }
  
  pub(crate) struct Error<T> {
-@@ -136,6 +137,7 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
+@@ -138,6 +139,7 @@
              pending_chunk: Default::default(),
              direction,
              last_activity: Instant::now(),
@@ -639,7 +629,7 @@ index 843803c..df89393 100644
          }
      }
  
-@@ -180,24 +182,37 @@ impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
+@@ -182,24 +184,37 @@
              match data {
                  Data::Chunk(bytes) => {
                      let data_len = bytes.len();
@@ -682,7 +672,7 @@ index 843803c..df89393 100644
                      }
                  }
                  Data::Eof => {
-@@ -220,6 +235,14 @@ pub(crate) struct DuplexPipe<F> {
+@@ -222,6 +237,14 @@
  }
  
  impl<F: Fn(SimplexDirection, usize) + Send + Clone> DuplexPipe<F> {
@@ -697,7 +687,7 @@ index 843803c..df89393 100644
      pub fn new(
          (dir1, source1, sink1): (SimplexDirection, Box<dyn Source>, Box<dyn Sink>),
          (dir2, source2, sink2): (SimplexDirection, Box<dyn Source>, Box<dyn Sink>),
-@@ -293,3 +316,73 @@ impl<F: Fn(SimplexDirection, usize) + Send + Clone> DuplexPipe<F> {
+@@ -295,3 +318,73 @@
  fn io_to_pipe_error<T>(id: T, io: io::Error) -> Error<T> {
      Error { id, io }
  }
@@ -773,7 +763,6 @@ index 843803c..df89393 100644
 +}
 diff --git a/lib/src/traffic_control.rs b/lib/src/traffic_control.rs
 new file mode 100644
-index 0000000..3d254b9
 --- /dev/null
 +++ b/lib/src/traffic_control.rs
 @@ -0,0 +1,338 @@
@@ -1116,10 +1105,9 @@ index 0000000..3d254b9
 +    }
 +}
 diff --git a/lib/src/tunnel.rs b/lib/src/tunnel.rs
-index 06242b1..213db12 100644
 --- a/lib/src/tunnel.rs
 +++ b/lib/src/tunnel.rs
-@@ -43,6 +43,7 @@ pub(crate) struct Tunnel {
+@@ -43,6 +43,7 @@
      /// Set at construction time for SNI-authenticated connections,
      /// or lazily on the first authenticated request for proxy-basic connections.
      connection_guard: Option<ConnectionGuard>,
@@ -1127,7 +1115,7 @@ index 06242b1..213db12 100644
      id: log_utils::IdChain<u64>,
  }
  
-@@ -81,6 +82,7 @@ impl Tunnel {
+@@ -81,6 +82,7 @@
          id: log_utils::IdChain<u64>,
      ) -> Self {
          Self {
@@ -1135,7 +1123,7 @@ index 06242b1..213db12 100644
              context,
              downstream,
              forwarder: Arc::new(Mutex::new(forwarder)),
-@@ -91,11 +93,26 @@ impl Tunnel {
+@@ -91,11 +93,26 @@
      }
  
      pub async fn listen(&mut self) -> io::Result<()> {
@@ -1163,7 +1151,7 @@ index 06242b1..213db12 100644
              x = shutdown_notification.wait() => {
                  match x {
                      Ok(_) => self.downstream.graceful_shutdown().await,
-@@ -103,7 +120,9 @@ impl Tunnel {
+@@ -103,7 +120,9 @@
                  }
              }
              x = self.listen_inner() => x,
@@ -1174,7 +1162,7 @@ index 06242b1..213db12 100644
      }
  
      fn resolve_username(
-@@ -161,6 +180,7 @@ impl Tunnel {
+@@ -161,6 +180,7 @@
              let authentication_policy = self.authentication_policy.clone();
              let log_id = self.id.clone();
              let protocol = self.downstream.protocol();
@@ -1182,7 +1170,7 @@ index 06242b1..213db12 100644
              let username = if context.metrics.per_client() {
                  self.resolve_username(request.as_ref())
              } else {
-@@ -296,6 +316,24 @@ impl Tunnel {
+@@ -296,6 +316,24 @@
                      "Authentication complete, promoting request"
                  );
  
@@ -1207,7 +1195,7 @@ index 06242b1..213db12 100644
                  // If this request carried credentials, relabel the session
                  // with the authenticated username (no-op if it's already labelled).
                  if let Ok(Some(source)) = auth_info_result {
-@@ -311,52 +349,57 @@ impl Tunnel {
+@@ -311,52 +349,57 @@
                          );
                      }
                  }
@@ -1293,20 +1281,21 @@ index 06242b1..213db12 100644
 +                                }
                              }
                          }
-+                        Err(e) => {
-+                            log_id!(debug, request_id, "Failed to complete request: {}", e);
-+                        }
-                     }
+-                    }
 -                    Err(e) => {
 -                        log_id!(debug, request_id, "Failed to complete request: {}", e);
 -                    }
 -                }
++                        Err(e) => {
++                            log_id!(debug, request_id, "Failed to complete request: {}", e);
++                        }
++                    }
 +                };
 +                tokio::select! { biased; _ = managed_session.cancelled() => {}, _ = work => {} }
              });
          }
      }
-@@ -368,6 +411,7 @@ impl Tunnel {
+@@ -368,6 +411,7 @@
          forwarder_auth: Option<authentication::Source<'static>>,
          tls_domain: String,
          update_metrics: F,
@@ -1314,7 +1303,7 @@ index 06242b1..213db12 100644
      ) -> Result<
          (),
          (
-@@ -451,7 +495,8 @@ impl Tunnel {
+@@ -451,7 +495,8 @@
              (pipe::SimplexDirection::Outgoing, dstr_rx, fwd_tx),
              (pipe::SimplexDirection::Incoming, fwd_rx, dstr_tx),
              update_metrics,
@@ -1324,7 +1313,7 @@ index 06242b1..213db12 100644
  
          log_id!(trace, request_id, "TCP connect: pipe exchange started");
          match pipe
-@@ -476,6 +521,7 @@ impl Tunnel {
+@@ -476,6 +521,7 @@
          forwarder_auth: Option<authentication::Source<'static>>,
          tls_domain: String,
          update_metrics: F,
@@ -1332,7 +1321,7 @@ index 06242b1..213db12 100644
      ) -> Result<
          (),
          (
-@@ -535,12 +581,15 @@ impl Tunnel {
+@@ -535,12 +581,15 @@
                      }
                  };
  
@@ -1354,7 +1343,7 @@ index 06242b1..213db12 100644
              }
              Ok(downstream::DatagramPipeHalves::Icmp(dstr_source, dstr_sink)) => {
                  let (fwd_source, fwd_sink) = match forwarder
-@@ -565,11 +614,14 @@ impl Tunnel {
+@@ -565,11 +614,14 @@
                      }
                  };
  
@@ -1375,10 +1364,9 @@ index 06242b1..213db12 100644
              Err(e) => {
                  return Err((
 diff --git a/lib/src/udp_pipe.rs b/lib/src/udp_pipe.rs
-index 05f143f..91277e0 100644
 --- a/lib/src/udp_pipe.rs
 +++ b/lib/src/udp_pipe.rs
-@@ -16,6 +16,7 @@ pub(crate) struct DuplexPipe<F: Send + Sync> {
+@@ -16,6 +16,7 @@
  
  /// Forwards UDP packets from a client to a target host
  struct LeftPipe<F: Send + Sync> {
@@ -1386,7 +1374,7 @@ index 05f143f..91277e0 100644
      source: Box<dyn datagram_pipe::Source<Output = downstream::UdpDatagram>>,
      sink: Box<dyn datagram_pipe::Sink<Input = downstream::UdpDatagram>>,
      shared: Arc<UdpPipeShared<F>>,
-@@ -25,6 +26,7 @@ struct LeftPipe<F: Send + Sync> {
+@@ -25,6 +26,7 @@
  
  /// Forwards UDP packets from a target host to a client
  struct RightPipe<F: Send + Sync> {
@@ -1394,7 +1382,7 @@ index 05f143f..91277e0 100644
      source: Box<dyn datagram_pipe::Source<Output = forwarder::UdpDatagramReadStatus>>,
      sink: Box<dyn datagram_pipe::Sink<Input = forwarder::UdpDatagram>>,
      shared: Arc<UdpPipeShared<F>>,
-@@ -71,6 +73,9 @@ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> LeftPipe<F> {
+@@ -71,6 +73,9 @@
              }
  
              let datagram_len = datagram.payload.len();
@@ -1404,7 +1392,7 @@ index 05f143f..91277e0 100644
              match self.sink.write(datagram).await? {
                  datagram_pipe::SendStatus::Sent => {
                      (self.shared.update_metrics)(self.direction, datagram_len);
-@@ -147,6 +152,9 @@ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> RightPipe<F> {
+@@ -147,6 +152,9 @@
  
              let meta = datagram.meta;
              let datagram_len = datagram.payload.len();
@@ -1414,7 +1402,7 @@ index 05f143f..91277e0 100644
              match self.sink.write(datagram).await? {
                  datagram_pipe::SendStatus::Sent => {
                      (self.shared.update_metrics)(self.direction, datagram_len);
-@@ -208,6 +216,14 @@ impl UdpConnection {
+@@ -208,6 +216,14 @@
  }
  
  impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> DuplexPipe<F> {
@@ -1429,7 +1417,7 @@ index 05f143f..91277e0 100644
      #[allow(clippy::type_complexity)]
      pub fn new(
          (source1, sink1): (
-@@ -230,6 +246,7 @@ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> DuplexPipe<F> {
+@@ -230,6 +246,7 @@
  
          Self {
              left_pipe: LeftPipe {
@@ -1437,7 +1425,7 @@ index 05f143f..91277e0 100644
                  source: source1,
                  sink: sink2,
                  shared: shared.clone(),
-@@ -237,6 +254,7 @@ impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> DuplexPipe<F> {
+@@ -237,6 +254,7 @@
                  next_connection_id: 0..,
              },
              right_pipe: RightPipe {
@@ -1446,10 +1434,9 @@ index 05f143f..91277e0 100644
                  sink: sink1,
                  shared,
 diff --git a/lib/tests/common/mod.rs b/lib/tests/common/mod.rs
-index a851187..78a5f8a 100644
 --- a/lib/tests/common/mod.rs
 +++ b/lib/tests/common/mod.rs
-@@ -303,6 +303,17 @@ pub struct Http3Session {
+@@ -304,6 +304,17 @@
  }
  
  impl Http3Session {
@@ -1467,7 +1454,7 @@ index a851187..78a5f8a 100644
      pub async fn connect(peer: &SocketAddr, server_name: &str, alpn: Option<&[u8]>) -> Self {
          let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
  
-@@ -466,7 +477,10 @@ impl Http3Session {
+@@ -469,7 +480,10 @@
          self.recv_response_with_method(&http::Method::GET).await
      }
  
@@ -1481,7 +1468,6 @@ index a851187..78a5f8a 100644
  
 diff --git a/lib/tests/managed.rs b/lib/tests/managed.rs
 new file mode 100644
-index 0000000..b354f00
 --- /dev/null
 +++ b/lib/tests/managed.rs
 @@ -0,0 +1,348 @@

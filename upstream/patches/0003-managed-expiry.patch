@@ -1,22 +1,20 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 8b29988..3f24bfb 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+@@ -5,6 +5,9 @@
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
  
  ## [Unreleased]
- 
++
 +- [Feature] Managed `expires_at` closes expired VPN sessions and denies reconnects
 +  independently of the admin panel; saved policies preserve expiry across restarts.
-+
+ 
  ### Added
  
- ### Changed
 diff --git a/Cargo.lock b/Cargo.lock
-index a35cb1f..9ae38ca 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -3568,6 +3568,7 @@ dependencies = [
+@@ -3641,6 +3641,7 @@
  name = "trusttunnel_endpoint"
  version = "0.0.0"
  dependencies = [
@@ -25,35 +23,32 @@ index a35cb1f..9ae38ca 100644
   "console-subscriber",
   "hex",
 diff --git a/endpoint/Cargo.toml b/endpoint/Cargo.toml
-index 83dd5b1..2e4a7cb 100644
 --- a/endpoint/Cargo.toml
 +++ b/endpoint/Cargo.toml
-@@ -8,6 +8,7 @@ name = "trusttunnel_endpoint"
+@@ -8,6 +8,7 @@
  doctest = false
  
  [dependencies]
 +chrono = { version = "0.4.26", default-features = false, features = ["clock"] }
- serde = { version = "1", features = ["derive"] }
  serde_json = "1"
  tempfile = "3"
+ clap = "4.5"
 diff --git a/endpoint/src/main.rs b/endpoint/src/main.rs
-index 3da32fb..c5ce269 100644
 --- a/endpoint/src/main.rs
 +++ b/endpoint/src/main.rs
-@@ -15,7 +15,7 @@ use trusttunnel::shutdown::Shutdown;
+@@ -15,7 +15,7 @@
  use trusttunnel::{log_utils, settings};
  mod management;
  
 -const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.2");
 +const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.3");
  const VERSION_PARAM_NAME: &str = "v_e_r_s_i_o_n_do_not_change_this_name_it_will_break";
+ const SETUP_WIZARD_PARAM_NAME: &str = "setup-wizard";
  const LOG_LEVEL_PARAM_NAME: &str = "log_level";
- const LOG_FILE_PARAM_NAME: &str = "log_file";
 diff --git a/endpoint/src/management.rs b/endpoint/src/management.rs
-index 9374eb5..7226e95 100644
 --- a/endpoint/src/management.rs
 +++ b/endpoint/src/management.rs
-@@ -22,6 +22,8 @@ pub struct ManagedUser {
+@@ -22,6 +22,8 @@
      pub enabled: bool,
      pub download_mbps: u32,
      pub upload_mbps: u32,
@@ -62,10 +57,11 @@ index 9374eb5..7226e95 100644
      pub revision: u64,
      #[serde(default)]
      pub max_http2_conns: Option<u32>,
-@@ -56,6 +58,15 @@ pub struct Management {
+@@ -55,6 +57,15 @@
+ }
  fn invalid() -> io::Error {
      io::Error::new(io::ErrorKind::InvalidData, "invalid managed state")
- }
++}
 +fn expiry_millis(value: Option<&str>) -> io::Result<Option<i64>> {
 +    value
 +        .map(|v| {
@@ -74,11 +70,10 @@ index 9374eb5..7226e95 100644
 +                .map_err(|_| invalid())
 +        })
 +        .transpose()
-+}
+ }
  fn secure_parent(path: &Path) -> io::Result<()> {
      let parent = std::fs::metadata(path.parent().ok_or_else(invalid)?)?;
-     if !parent.is_dir() || parent.mode() & 0o027 != 0 {
-@@ -91,6 +102,7 @@ impl State {
+@@ -91,6 +102,7 @@
                          enabled: true,
                          download_mbps: 0,
                          upload_mbps: 0,
@@ -86,7 +81,7 @@ index 9374eb5..7226e95 100644
                          revision: 1,
                          max_http2_conns: c.max_http2_conns,
                          max_http3_conns: c.max_http3_conns,
-@@ -122,6 +134,7 @@ impl State {
+@@ -122,6 +134,7 @@
                  || u.revision == 0
                  || u.download_mbps > 1000000
                  || u.upload_mbps > 1000000
@@ -94,7 +89,7 @@ index 9374eb5..7226e95 100644
                  || !names.insert(&u.username)
                  || !ids.insert(&u.id)
              {
-@@ -152,7 +165,7 @@ impl State {
+@@ -152,7 +165,7 @@
          std::fs::File::open(parent)?.sync_all()
      }
      fn public(&self) -> serde_json::Value {
@@ -103,7 +98,7 @@ index 9374eb5..7226e95 100644
      }
  }
  impl Management {
-@@ -184,6 +197,8 @@ impl Management {
+@@ -184,6 +197,8 @@
                      enabled: u.enabled,
                      download_mbps: u.download_mbps,
                      upload_mbps: u.upload_mbps,
@@ -112,7 +107,7 @@ index 9374eb5..7226e95 100644
                  })
                  .collect::<Vec<_>>(),
          );
-@@ -347,6 +362,17 @@ impl Drop for SocketGuard {
+@@ -347,6 +362,17 @@
  mod tests {
      use super::*;
      #[test]
@@ -130,7 +125,7 @@ index 9374eb5..7226e95 100644
      fn saved_state_is_private_and_public_response_contains_no_secrets() {
          let dir = tempfile::tempdir().unwrap();
          std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-@@ -361,6 +387,7 @@ mod tests {
+@@ -361,6 +387,7 @@
                  enabled: true,
                  download_mbps: 2,
                  upload_mbps: 1,
@@ -138,7 +133,7 @@ index 9374eb5..7226e95 100644
                  revision: 2,
                  max_http2_conns: None,
                  max_http3_conns: None,
-@@ -373,6 +400,10 @@ mod tests {
+@@ -373,6 +400,10 @@
          let loaded = State::load_or_import(&path, &[]).unwrap();
          assert_eq!(loaded.generation, 3);
          assert_eq!(loaded.users[0].download_mbps, 2);
@@ -150,10 +145,9 @@ index 9374eb5..7226e95 100644
          assert!(State::load_or_import(&path, &[]).is_err());
      }
 diff --git a/lib/src/pipe.rs b/lib/src/pipe.rs
-index df89393..073bcd7 100644
 --- a/lib/src/pipe.rs
 +++ b/lib/src/pipe.rs
-@@ -366,6 +366,7 @@ mod managed_tests {
+@@ -368,6 +368,7 @@
              enabled: true,
              download_mbps: 1,
              upload_mbps: 1,
@@ -162,10 +156,9 @@ index df89393..073bcd7 100644
          let session = control.session();
          let user = session.bind("alice").unwrap().unwrap();
 diff --git a/lib/src/traffic_control.rs b/lib/src/traffic_control.rs
-index 3d254b9..6e0cbe2 100644
 --- a/lib/src/traffic_control.rs
 +++ b/lib/src/traffic_control.rs
-@@ -15,6 +15,13 @@ pub struct TrafficPolicy {
+@@ -15,6 +15,13 @@
      pub enabled: bool,
      pub download_mbps: u32,
      pub upload_mbps: u32,
@@ -179,7 +172,7 @@ index 3d254b9..6e0cbe2 100644
  }
  
  struct Bucket {
-@@ -52,8 +59,34 @@ pub(crate) struct UserControl {
+@@ -52,8 +59,34 @@
      download: Mutex<Bucket>,
      upload: Mutex<Bucket>,
      changed: watch::Sender<u64>,
@@ -214,7 +207,7 @@ index 3d254b9..6e0cbe2 100644
      pub(crate) fn refund(&self, direction: SimplexDirection, bytes: usize) {
          let mut b = match direction {
              SimplexDirection::Incoming => self.download.lock().unwrap(),
-@@ -68,9 +101,22 @@ impl UserControl {
+@@ -68,9 +101,22 @@
              download: Mutex::new(Bucket::new(p.download_mbps)),
              upload: Mutex::new(Bucket::new(p.upload_mbps)),
              changed: watch::channel(0).0,
@@ -237,7 +230,7 @@ index 3d254b9..6e0cbe2 100644
          self.download.lock().unwrap().update(p.download_mbps);
          self.upload.lock().unwrap().update(p.upload_mbps);
          self.enabled.store(p.enabled, Ordering::Release);
-@@ -81,9 +127,12 @@ impl UserControl {
+@@ -81,9 +127,12 @@
          direction: SimplexDirection,
          mut bytes: usize,
      ) -> io::Result<()> {
@@ -251,7 +244,7 @@ index 3d254b9..6e0cbe2 100644
                  return Err(io::ErrorKind::PermissionDenied.into());
              }
              changed.borrow_and_update();
-@@ -108,7 +157,7 @@ impl UserControl {
+@@ -108,7 +157,7 @@
                  }
              };
              if let Some(delay) = delay {
@@ -260,7 +253,7 @@ index 3d254b9..6e0cbe2 100644
              }
          }
          Ok(())
-@@ -126,6 +175,7 @@ pub(crate) struct ManagedSession {
+@@ -126,6 +175,7 @@
      owner: Mutex<Option<String>>,
      cancel: watch::Sender<bool>,
      control: Weak<TrafficControl>,
@@ -268,7 +261,7 @@ index 3d254b9..6e0cbe2 100644
  }
  impl Drop for ManagedSession {
      fn drop(&mut self) {
-@@ -140,9 +190,20 @@ impl ManagedSession {
+@@ -140,9 +190,20 @@
      }
      pub(crate) async fn cancelled(&self) {
          let mut rx = self.cancel.subscribe();
@@ -292,7 +285,7 @@ index 3d254b9..6e0cbe2 100644
              }
          }
      }
-@@ -157,13 +218,16 @@ impl ManagedSession {
+@@ -157,12 +218,15 @@
          };
          let user = policies
              .get(username)
@@ -303,14 +296,13 @@ index 3d254b9..6e0cbe2 100644
          let mut owner = self.owner.lock().unwrap();
          if *self.cancel.borrow() || owner.as_ref().is_some_and(|u| u != username) {
              return Err(io::ErrorKind::PermissionDenied.into());
-         }
++        }
 +        if owner.is_none() {
 +            self.bound.send_replace(Some(user.clone()));
-+        }
+         }
          *owner = Some(username.into());
          Ok(Some(user))
-     }
-@@ -198,10 +262,7 @@ impl TrafficControl {
+@@ -198,10 +262,7 @@
              .collect();
          for session in sessions {
              if let Some(name) = session.owner.lock().unwrap().as_ref() {
@@ -322,7 +314,7 @@ index 3d254b9..6e0cbe2 100644
                      session.cancel.send_replace(true);
                  }
              }
-@@ -233,6 +294,7 @@ impl TrafficControl {
+@@ -233,6 +294,7 @@
              owner: Mutex::new(None),
              cancel: watch::channel(false).0,
              control: Arc::downgrade(self),
@@ -330,13 +322,14 @@ index 3d254b9..6e0cbe2 100644
          });
          self.sessions
              .lock()
-@@ -251,8 +313,59 @@ mod tests {
+@@ -251,7 +313,58 @@
              enabled: true,
              download_mbps: 1,
              upload_mbps: 1,
+-        }
 +            expires_at_unix_ms: None,
-         }
-     }
++        }
++    }
 +    #[test]
 +    fn expiry_boundary_latches_until_the_deadline_changes() {
 +        let mut p = policy("alice");
@@ -386,15 +379,13 @@ index 3d254b9..6e0cbe2 100644
 +        let user = renewed.bind("alice").unwrap().unwrap();
 +        user.acquire(SimplexDirection::Incoming, 1).await.unwrap();
 +        assert!(*a.cancel.borrow());
-+    }
+     }
      #[tokio::test(start_paused = true)]
      async fn parallel_streams_share_bucket_and_directions_are_independent() {
-         let c = Arc::new(TrafficControl::default());
 diff --git a/lib/tests/managed.rs b/lib/tests/managed.rs
-index b354f00..f4caf6d 100644
 --- a/lib/tests/managed.rs
 +++ b/lib/tests/managed.rs
-@@ -140,12 +140,14 @@ fn make_endpoint() -> (SocketAddr, common::File, Arc<Core>) {
+@@ -140,12 +140,14 @@
              enabled: true,
              download_mbps: 2,
              upload_mbps: 2,
@@ -409,7 +400,7 @@ index b354f00..f4caf6d 100644
          },
      ]);
      (endpoint, cert, core)
-@@ -228,7 +230,7 @@ async fn h3_parallel_connections_share_upload_limit() {
+@@ -228,7 +230,7 @@
      Box::pin(shared_rate_over_transport(true, true)).await;
  }
  
@@ -418,7 +409,7 @@ index b354f00..f4caf6d 100644
      Request::builder()
          .method("CONNECT")
          .uri(target.to_string())
-@@ -244,7 +246,7 @@ fn connect_request(target: SocketAddr, username: &str) -> Request<hyper::Body> {
+@@ -244,7 +246,7 @@
  }
  async fn h2_echo(
      endpoint: SocketAddr,
@@ -427,7 +418,7 @@ index b354f00..f4caf6d 100644
      name: &str,
  ) -> (
      hyper::client::conn::SendRequest<hyper::Body>,
-@@ -267,7 +269,29 @@ async fn h2_echo(
+@@ -267,7 +269,29 @@
      assert_eq!(resp.status(), http::StatusCode::OK);
      (client, hyper::upgrade::on(resp).await.unwrap(), driver)
  }
@@ -458,7 +449,7 @@ index b354f00..f4caf6d 100644
      let (endpoint, cert, core) = make_endpoint();
      let server = tokio::spawn({
          let core = core.clone();
-@@ -304,7 +328,7 @@ async fn targeted_kick(h3: bool) {
+@@ -304,7 +328,7 @@
                      .status,
                  http::StatusCode::OK
              );
@@ -467,7 +458,7 @@ index b354f00..f4caf6d 100644
              tokio::time::timeout(Duration::from_secs(3), alice.wait_for_peer_close())
                  .await
                  .unwrap();
-@@ -315,7 +339,7 @@ async fn targeted_kick(h3: bool) {
+@@ -315,7 +339,7 @@
          } else {
              let (_alice_client, mut alice, mut driver) = h2_echo(endpoint, target, "alice").await;
              let (_bob_client, mut bob, bob_driver) = h2_echo(endpoint, target, "bob").await;
@@ -476,7 +467,7 @@ index b354f00..f4caf6d 100644
              let mut ack = [0u8; 2];
              let closed = tokio::time::timeout(Duration::from_secs(3), alice.read(&mut ack))
                  .await
-@@ -340,9 +364,100 @@ async fn targeted_kick(h3: bool) {
+@@ -340,9 +364,100 @@
  }
  #[tokio::test]
  async fn h2_kick_closes_only_the_target_transport() {
@@ -486,6 +477,7 @@ index b354f00..f4caf6d 100644
  #[tokio::test]
  async fn h3_kick_closes_only_the_target_transport() {
 -    Box::pin(targeted_kick(true)).await;
+-}
 +    Box::pin(targeted_kick(true, false)).await;
 +}
 +#[tokio::test]
@@ -578,4 +570,4 @@ index b354f00..f4caf6d 100644
 +#[tokio::test]
 +async fn h3_expiry_closes_udp_mux_after_real_datagram() {
 +    Box::pin(udp_expiry(true)).await;
- }
++}

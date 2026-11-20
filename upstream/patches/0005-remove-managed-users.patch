@@ -1,35 +1,32 @@
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index bab7fe4..be00af0 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+@@ -5,6 +5,9 @@
+ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
  
  ## [Unreleased]
- 
++
 +- [Feature] Managed `remove` revokes sessions and credentials durably by user ID
 +  with generation/revision checks while preserving monthly usage history.
-+
+ 
  - [Feature] Managed `quota_bytes` enforces a shared UTC monthly traffic budget
    with a durable usage journal, 24-month history and fail-closed crash recovery.
- 
 diff --git a/endpoint/src/main.rs b/endpoint/src/main.rs
-index af3a8b3..4c1bef1 100644
 --- a/endpoint/src/main.rs
 +++ b/endpoint/src/main.rs
-@@ -15,7 +15,7 @@ use trusttunnel::shutdown::Shutdown;
+@@ -15,7 +15,7 @@
  use trusttunnel::{log_utils, settings};
  mod management;
  
 -const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.4");
 +const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.5");
  const VERSION_PARAM_NAME: &str = "v_e_r_s_i_o_n_do_not_change_this_name_it_will_break";
+ const SETUP_WIZARD_PARAM_NAME: &str = "setup-wizard";
  const LOG_LEVEL_PARAM_NAME: &str = "log_level";
- const LOG_FILE_PARAM_NAME: &str = "log_file";
 diff --git a/endpoint/src/management.rs b/endpoint/src/management.rs
-index ad625cc..2f24a4c 100644
 --- a/endpoint/src/management.rs
 +++ b/endpoint/src/management.rs
-@@ -55,6 +55,12 @@ enum Request {
+@@ -55,6 +55,12 @@
          expected_generation: u64,
          user: ManagedUser,
      },
@@ -42,7 +39,7 @@ index ad625cc..2f24a4c 100644
      Disconnect {
          username: String,
      },
-@@ -92,6 +98,37 @@ fn secure_parent(path: &Path) -> io::Result<()> {
+@@ -92,6 +98,37 @@
      Ok(())
  }
  impl State {
@@ -80,7 +77,7 @@ index ad625cc..2f24a4c 100644
      pub fn load_or_import(path: &Path, clients: &[Client]) -> io::Result<Self> {
          if !path.is_absolute() {
              return Err(invalid());
-@@ -182,7 +219,7 @@ impl State {
+@@ -182,7 +219,7 @@
          std::fs::File::open(parent)?.sync_all()
      }
      fn public(&self) -> serde_json::Value {
@@ -89,7 +86,7 @@ index ad625cc..2f24a4c 100644
      }
  }
  impl Management {
-@@ -236,6 +273,38 @@ impl Management {
+@@ -236,6 +273,38 @@
          match request {
              Request::Status => self.reply(&state),
              Request::Usage { month, after } => self.usage_reply(&month, &after),
@@ -128,7 +125,7 @@ index ad625cc..2f24a4c 100644
              Request::Disconnect { username } => {
                  if !state.users.iter().any(|u| u.username == username) {
                      return serde_json::json!({"ok":false,"error":"user_not_found"});
-@@ -472,6 +541,59 @@ impl Drop for SocketGuard {
+@@ -472,6 +541,59 @@
  mod tests {
      use super::*;
      #[test]

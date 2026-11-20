@@ -1,7 +1,7 @@
 diff --git a/AGENTS.md b/AGENTS.md
 --- a/AGENTS.md
 +++ b/AGENTS.md
-@@ -180,6 +180,7 @@
+@@ -182,6 +182,7 @@
  ### II. Code Quality Standards
  
  - Preserve pending HTTP/3 response headers until delivery or stream reset; never send DATA or FIN first.
@@ -32,8 +32,8 @@ diff --git a/endpoint/src/main.rs b/endpoint/src/main.rs
 -const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.5-quic.1");
 +const VERSION_STRING: &str = concat!(env!("TRUSTTUNNEL_VERSION"), "-admin-preview.5-quic.2");
  const VERSION_PARAM_NAME: &str = "v_e_r_s_i_o_n_do_not_change_this_name_it_will_break";
+ const SETUP_WIZARD_PARAM_NAME: &str = "setup-wizard";
  const LOG_LEVEL_PARAM_NAME: &str = "log_level";
- const LOG_FILE_PARAM_NAME: &str = "log_file";
 diff --git a/lib/src/quic_multiplexer.rs b/lib/src/quic_multiplexer.rs
 --- a/lib/src/quic_multiplexer.rs
 +++ b/lib/src/quic_multiplexer.rs
@@ -62,7 +62,7 @@ diff --git a/lib/src/quic_multiplexer.rs b/lib/src/quic_multiplexer.rs
  
          Ok(Self {
              core_settings,
-@@ -752,6 +756,82 @@
+@@ -755,6 +759,82 @@
      }
  }
  

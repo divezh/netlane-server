@@ -57,7 +57,7 @@ jobs:
       - name: Fetch pinned upstream and apply patch
         run: |
           git clone https://github.com/TrustTunnel/TrustTunnel.git research/upstream
-          git -C research/upstream checkout fab5b8353a19332f935fa30869307d37d4a898d1
+          git -C research/upstream checkout 113cdc89559b9d2698e1477b3d0af89e95c0b7cf
           git -C research/upstream apply ../../upstream/patches/0001-reload-credentials.patch
           git -C research/upstream apply ../../upstream/patches/0002-managed-control-and-traffic.patch
           git -C research/upstream apply ../../upstream/patches/0003-managed-expiry.patch

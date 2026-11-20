@@ -32,7 +32,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $artifacts = Join-Path $root 'artifacts'
-$upstreamCommit = 'fab5b8353a19332f935fa30869307d37d4a898d1'
+$upstreamCommit = '113cdc89559b9d2698e1477b3d0af89e95c0b7cf'
 $goImage = 'netlane-local-go'
 if ($All) { $Panel = $true; $Bundle = $true }
 $checkOnly = -not ($Panel -or $Bundle)

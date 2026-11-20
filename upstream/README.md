@@ -2,7 +2,7 @@
 
 Источник: https://github.com/TrustTunnel/TrustTunnel
 
-Закреплённая база: тег `v1.1.0`, commit `fab5b8353a19332f935fa30869307d37d4a898d1`. Лицензия upstream: Apache-2.0, копия рядом в `LICENSE.TrustTunnel`. Проект панели независим от разработчиков TrustTunnel.
+Закреплённая база: тег `v1.3.1`, commit `113cdc89559b9d2698e1477b3d0af89e95c0b7cf`. Лицензия upstream: Apache-2.0, копия рядом в `LICENSE.TrustTunnel`. Проект панели независим от разработчиков TrustTunnel.
 
 Управляемый бинарник явно помечает версию суффиксом `-admin-preview.5-quic.2`, чтобы не выдавать изменённую сборку за официальный релиз. `quic.1` обозначает исправление порядка HTTP/3-ответов, `quic.2` добавляет настройку UDP-буферов; managed API и формат состояния сохраняются.
 
@@ -22,7 +22,7 @@
 
 ```sh
 git clone https://github.com/TrustTunnel/TrustTunnel.git research/upstream
-git -C research/upstream checkout fab5b8353a19332f935fa30869307d37d4a898d1
+git -C research/upstream checkout 113cdc89559b9d2698e1477b3d0af89e95c0b7cf
 git -C research/upstream apply ../../upstream/patches/0001-reload-credentials.patch
 git -C research/upstream apply ../../upstream/patches/0002-managed-control-and-traffic.patch
 git -C research/upstream apply ../../upstream/patches/0003-managed-expiry.patch
