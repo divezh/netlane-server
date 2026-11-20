@@ -238,6 +238,8 @@ function Build-Bundle {
         'bash', '-c', "git config --global --add safe.directory /repo && $test bash scripts/build-dev-bundle.sh"))
 }
 
+# A release runs the Go tests on Linux, as CI does: natively on Windows the Unix socket-path tests fail.
+if ($Release -and -not $hasDocker) { throw '-Release needs a running Docker Desktop (Linux containers): start it and run again.' }
 if ($Panel) { Build-Panel }
 if ($Bundle) { Build-Bundle }
 
