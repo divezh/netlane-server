@@ -52,7 +52,7 @@ netlane-update --file /root/trusttunnel-dev.tar.gz --yes
 ## Выпуск версии
 
 1. Обновить версию в CHANGELOG и закоммитить в `main`.
-2. Actions → Release → Run workflow, тег `netlane-X.Y.Z`. Workflow тестирует коммит, собирает комплект с версией X.Y.Z и создаёт черновик `Netlane X.Y.Z - Server` с `trusttunnel-dev.tar.gz` и `.sha256`.
+2. Собрать комплект локально: `scripts/build-local.ps1 -Release X.Y.Z` (те же проверки, что в CI, из чистого коммита) и выложить черновик `Netlane X.Y.Z - Server` с `trusttunnel-dev.tar.gz` и `.sha256` через `gh release create netlane-X.Y.Z --draft --target <коммит>`. Либо Actions → Release → Run workflow с тегом `netlane-X.Y.Z`: workflow тестирует коммит, собирает комплект и создаёт черновик сам.
 3. Владелец подписывает комплект своим ключом и публикует черновик ([подпись релизов](SIGNING.md)).
 4. Через пару минут после публикации серверы видят новую версию в карточке «Обновление панели».
 
