@@ -16,6 +16,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build-local.ps1 -Bundle
 -Bundle        Managed endpoint (Rust, in Docker) and artifacts\trusttunnel-dev.tar.gz for deploy-vps.
 -All           Panel and Bundle.
 -SkipTests     Build only; skip cargo fmt/clippy/tests and Go tests. Use for quick iterations, never for a release.
+-Release X.Y.Z Release bundle, the same steps as CI: Go vet and race tests, cargo audit, fmt, clippy and tests,
+               a release (not debug) endpoint, the panel/endpoint E2E test and NETLANE_VERSION=X.Y.Z. Needs a clean worktree, since
+               the bundle records the commit, and a "## X.Y.Z" section in CHANGELOG.md.
 
 When the managed endpoint is already in artifacts\trusttunnel_endpoint, scripts\build-dev-bundle.ps1
 builds the bundle without Docker: it rebuilds only the panel and packs the same archive.
@@ -27,7 +30,8 @@ param(
     [switch]$Panel,
     [switch]$Bundle,
     [switch]$All,
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [string]$Release
 )
 $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -36,6 +40,15 @@ $upstreamCommit = '113cdc89559b9d2698e1477b3d0af89e95c0b7cf'
 $upstreamVersion = '1.3.1'
 $goImage = 'netlane-local-go'
 if ($All) { $Panel = $true; $Bundle = $true }
+if ($Release) {
+    if ($Release -notmatch '^\d+\.\d+\.\d+$') { throw '-Release takes a version like 0.7.0.' }
+    if ($SkipTests) { throw 'A release always runs the full checks; drop -SkipTests.' }
+    if (& git -C $root status --porcelain) { throw 'Commit or stash local changes first: the release bundle records the commit it was built from.' }
+    if (-not (Select-String -LiteralPath (Join-Path $root 'CHANGELOG.md') -Pattern "^## $([regex]::Escape($Release))$" -Quiet)) { throw "CHANGELOG.md has no section ## $Release (the release notes come from it)." }
+    # Go vet and race tests run with the panel target, as in CI's go job.
+    $Panel = $true
+    $Bundle = $true
+}
 $checkOnly = -not ($Panel -or $Bundle)
 
 function Invoke-Native([string]$File, [string[]]$Arguments) {
@@ -200,13 +213,18 @@ function Build-Bundle {
         Invoke-Native 'git' @('-C', $upstream, 'apply', $patches[$i].FullName)
     }
     Invoke-Native 'docker' @('build', '-q', '-t', 'tt-upstream-test', '-f', (Join-Path $root 'deploy\ci\upstream.Dockerfile'), (Join-Path $root 'deploy\ci'))
-    $cargo = 'cargo build --locked -p trusttunnel_endpoint'
+    $cargoProfile = if ($Release) { 'release' } else { 'debug' }
+    $cargo = 'cargo build --locked -p trusttunnel_endpoint' + $(if ($Release) { ' --release' } else { '' })
     if (-not $SkipTests) {
         $cargo = 'cargo fmt --all -- --check && cargo clippy --locked -- -D warnings && cargo test --locked --workspace && ' + $cargo
     }
+    if ($Release) {
+        # Same advisory exceptions as CI (.github/workflows/ci.yml).
+        $cargo = 'cargo install --locked cargo-audit@0.23.0 >/dev/null 2>&1 && cargo audit --ignore RUSTSEC-2026-0258 --ignore RUSTSEC-2025-0134 && ' + $cargo
+    }
     # Target and registry live in Docker volumes: much faster than a Windows bind mount and kept between runs.
     Invoke-Native 'docker' @('run', '--rm', '-e', "TRUSTTUNNEL_VERSION=$upstreamVersion", '-v', "${upstream}:/src", '-v', 'netlane-cargo-target:/src/target', '-v', 'netlane-cargo-registry:/usr/local/cargo/registry', '-v', "${artifacts}:/out",
-        'tt-upstream-test', 'bash', '-c', "$cargo && cp target/debug/trusttunnel_endpoint /out/trusttunnel_endpoint")
+        'tt-upstream-test', 'bash', '-c', "$cargo && cp target/$cargoProfile/trusttunnel_endpoint /out/trusttunnel_endpoint")
 
     Write-Host ''
     Write-Host '== Install bundle'
@@ -215,8 +233,9 @@ function Build-Bundle {
     if (-not $SkipTests) {
         $test = 'CGO_ENABLED=0 go build -o artifacts/trusttunnel-admin ./cmd/trusttunnel-admin && python3 scripts/test-managed-endpoint.py artifacts/trusttunnel_endpoint artifacts/trusttunnel-admin && '
     }
-    Invoke-Native 'docker' @('run', '--rm', '-v', $dockerRepo, '-v', 'netlane-go-mod:/go/pkg/mod', '-v', 'netlane-go-cache:/root/.cache/go-build', '-w', '/repo', $goImage,
-        'bash', '-c', "git config --global --add safe.directory /repo && $test bash scripts/build-dev-bundle.sh")
+    $versionEnv = if ($Release) { @('-e', "NETLANE_VERSION=$Release") } else { @() }
+    Invoke-Native 'docker' (@('run', '--rm') + $versionEnv + @('-v', $dockerRepo, '-v', 'netlane-go-mod:/go/pkg/mod', '-v', 'netlane-go-cache:/root/.cache/go-build', '-w', '/repo', $goImage,
+        'bash', '-c', "git config --global --add safe.directory /repo && $test bash scripts/build-dev-bundle.sh"))
 }
 
 if ($Panel) { Build-Panel }
@@ -225,7 +244,13 @@ if ($Bundle) { Build-Bundle }
 Write-Host ''
 Write-Host ("Done in {0:mm\:ss}. Artifacts:" -f ((Get-Date) - $started))
 foreach ($name in 'trusttunnel-admin', 'trusttunnel_endpoint', 'trusttunnel-dev.tar.gz') { Write-Artifact (Join-Path $artifacts $name) }
-if ($Bundle) {
+if ($Release) {
+    $commit = (& git -C $root rev-parse HEAD).Trim()
+    Write-Host ''
+    Write-Host "Release $Release bundle from commit $commit (release endpoint, all checks passed)."
+    Write-Host "Publish: tag that commit netlane-$Release, create a draft release with artifacts\trusttunnel-dev.tar.gz and"
+    Write-Host 'its .sha256, sign it off GitHub (docs/SIGNING.md) and run the "Publish signed release" workflow.'
+} elseif ($Bundle) {
     Write-Host ''
     Write-Host 'Install on a fresh VPS:'
     Write-Host '  powershell -ExecutionPolicy Bypass -File scripts\deploy-vps.ps1 -Target root@IP -Domain vpn.example.com -Bundle artifacts\trusttunnel-dev.tar.gz'
