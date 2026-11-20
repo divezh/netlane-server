@@ -78,7 +78,7 @@ jobs:
       - name: Build and test managed endpoint
         run: |
           mkdir -p artifacts .cache/cargo-registry
-          docker run --rm -v "$PWD/research/upstream:/src" -v "$PWD/.cache/cargo-registry:/usr/local/cargo/registry" -v "$PWD/artifacts:/out" tt-upstream-test bash -c 'cargo install --locked cargo-audit@0.23.0 >/dev/null 2>&1 && cargo audit --ignore RUSTSEC-2026-0258 --ignore RUSTSEC-2025-0134 && cargo fmt --all -- --check && cargo clippy --locked -- -D warnings && cargo test --locked --workspace && cargo build --release --locked -p trusttunnel_endpoint && cp target/release/trusttunnel_endpoint /out/trusttunnel_endpoint'
+          docker run --rm -e TRUSTTUNNEL_VERSION=1.3.1 -v "$PWD/research/upstream:/src" -v "$PWD/.cache/cargo-registry:/usr/local/cargo/registry" -v "$PWD/artifacts:/out" tt-upstream-test bash -c 'cargo install --locked cargo-audit@0.23.0 >/dev/null 2>&1 && cargo audit --ignore RUSTSEC-2026-0258 --ignore RUSTSEC-2025-0134 && cargo fmt --all -- --check && cargo clippy --locked -- -D warnings && cargo test --locked --workspace && cargo build --release --locked -p trusttunnel_endpoint && cp target/release/trusttunnel_endpoint /out/trusttunnel_endpoint'
       - name: Test panel and actual managed endpoint together
         run: |
           CGO_ENABLED=0 go build -o artifacts/trusttunnel-admin ./cmd/trusttunnel-admin

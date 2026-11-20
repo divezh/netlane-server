@@ -77,8 +77,8 @@ if (-not ($bytes[0] -eq 0x7F -and $bytes[1] -eq 0x45 -and $bytes[2] -eq 0x4C -an
     throw "$endpoint is not a linux/amd64 ELF binary. The bundle needs the managed endpoint, not a Windows build."
 }
 $text = [Text.Encoding]::ASCII.GetString($bytes)
-if ($text -notmatch 'admin-preview\.5') {
-    Write-Warning 'The endpoint does not report the -admin-preview.5 build; the panel may refuse it.'
+if (-not $text.Contains('1.3.1-admin-preview.5-quic.2')) {
+    throw 'Expected the managed TrustTunnel 1.3.1 endpoint. Build it with scripts/build-local.ps1 -Bundle or pass -Endpoint; an older release must not be bundled as this migration.'
 }
 
 $revision = (& git -C $root rev-parse --short HEAD 2>&1) -join ''

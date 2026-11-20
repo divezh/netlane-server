@@ -33,6 +33,7 @@ $ErrorActionPreference = 'Stop'
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $artifacts = Join-Path $root 'artifacts'
 $upstreamCommit = '113cdc89559b9d2698e1477b3d0af89e95c0b7cf'
+$upstreamVersion = '1.3.1'
 $goImage = 'netlane-local-go'
 if ($All) { $Panel = $true; $Bundle = $true }
 $checkOnly = -not ($Panel -or $Bundle)
@@ -204,7 +205,7 @@ function Build-Bundle {
         $cargo = 'cargo fmt --all -- --check && cargo clippy --locked -- -D warnings && cargo test --locked --workspace && ' + $cargo
     }
     # Target and registry live in Docker volumes: much faster than a Windows bind mount and kept between runs.
-    Invoke-Native 'docker' @('run', '--rm', '-v', "${upstream}:/src", '-v', 'netlane-cargo-target:/src/target', '-v', 'netlane-cargo-registry:/usr/local/cargo/registry', '-v', "${artifacts}:/out",
+    Invoke-Native 'docker' @('run', '--rm', '-e', "TRUSTTUNNEL_VERSION=$upstreamVersion", '-v', "${upstream}:/src", '-v', 'netlane-cargo-target:/src/target', '-v', 'netlane-cargo-registry:/usr/local/cargo/registry', '-v', "${artifacts}:/out",
         'tt-upstream-test', 'bash', '-c', "$cargo && cp target/debug/trusttunnel_endpoint /out/trusttunnel_endpoint")
 
     Write-Host ''

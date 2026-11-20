@@ -22,7 +22,7 @@ import urllib.request
 from pathlib import Path
 
 endpoint, panel = (str(Path(arg).resolve()) for arg in sys.argv[1:3])
-assert "-admin-preview.5" in subprocess.check_output([endpoint,"--version"],text=True), "wrong endpoint build"
+assert subprocess.check_output([endpoint,"--version"],text=True).strip() == "1.3.1-admin-preview.5-quic.2", "wrong endpoint build"
 os.umask(0o077)
 
 

@@ -3,7 +3,10 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 [[ -x artifacts/trusttunnel_endpoint ]] || { echo 'Build the managed Linux endpoint first.' >&2; exit 1; }
-artifacts/trusttunnel_endpoint --version | grep -q -- '-admin-preview.5'
+[[ $(artifacts/trusttunnel_endpoint --version) == '1.3.1-admin-preview.5-quic.2' ]] || {
+  echo 'Build the managed TrustTunnel 1.3.1 endpoint with the pinned Netlane patches first.' >&2
+  exit 1
+}
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT
 mkdir -p "$stage/bin"
