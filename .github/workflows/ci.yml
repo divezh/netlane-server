@@ -67,6 +67,7 @@ jobs:
           git -C research/upstream apply ../../upstream/patches/0007-block-bittorrent.patch
           git -C research/upstream apply ../../upstream/patches/0008-http3-deferred-response.patch
           git -C research/upstream apply ../../upstream/patches/0009-quic-socket-buffers.patch
+          git -C research/upstream apply ../../upstream/patches/0010-url-security-update.patch
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |

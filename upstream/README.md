@@ -32,6 +32,7 @@ git -C research/upstream apply ../../upstream/patches/0006-dependency-security-u
 git -C research/upstream apply ../../upstream/patches/0007-block-bittorrent.patch
 git -C research/upstream apply ../../upstream/patches/0008-http3-deferred-response.patch
 git -C research/upstream apply ../../upstream/patches/0009-quic-socket-buffers.patch
+git -C research/upstream apply ../../upstream/patches/0010-url-security-update.patch
 docker build -t tt-upstream-test -f deploy/ci/upstream.Dockerfile deploy/ci
 docker run --rm -v "$PWD/research/upstream:/src" tt-upstream-test \
   bash -c 'cargo fmt --all -- --check && cargo clippy --locked -- -D warnings && cargo test --locked --workspace'
