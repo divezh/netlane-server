@@ -214,7 +214,7 @@ func (s *Store) Create(ctx context.Context, actor, username, password string, p 
 	if err := p.Validate(); err != nil {
 		return User{}, err
 	}
-	u := User{ID: security.Token(16), Username: username, Policy: p, DesiredRevision: 1, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
+	u := User{ID: security.Token(16), Username: username, Policy: p, DesiredRevision: 1, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	sealed, err := security.Seal(s.key, u.ID, password)
 	if err != nil {
 		return User{}, err

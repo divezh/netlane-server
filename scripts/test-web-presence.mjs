@@ -20,7 +20,7 @@ const groups = [
   {id:'work',name:'Работа',created_at:'2026-11-05T09:00:00Z',locations:['wars'],members:1}
 ];
 const users = ['admin','employee'].map((username,i) => ({
-  id:`u${i}`,username,policy,desired_revision:1,applied_revision:1,
+  id:`u${i}`,username,created_at:`2026-11-0${i+1}T09:00:00Z`,policy,desired_revision:1,applied_revision:1,
   group:i===0?{id:'all',name:'Все локации'}:{id:'work',name:'Работа'}
 }));
 let clients = [{username:'employee',sessions:2,inbound:1,outbound:1}];
@@ -90,6 +90,21 @@ try {
   await page.goto('http://127.0.0.1:18749/');
   await page.locator('.overview-metrics').waitFor();
   await check('1','2 транспортных соединения',1);
+  await page.locator('.online-link').click();
+  await page.locator('#user-filter').waitFor();
+  assert.equal(await page.locator('#user-filter').inputValue(),'online');
+  assert.equal(await page.locator('.user-check[data-select]').count(),1);
+  assert.equal(await page.locator('.user-check[data-select]').getAttribute('data-select'),'u1');
+  assert.match(await page.locator('td[data-label="Расход"]').textContent(),/без лимита/);
+  assert.equal(await page.locator('.usage-bar').count(),0);
+  await page.evaluate(()=>{
+    state.control={...state.control,usage:true,users:[{id:'u1',quota_used_bytes:85,quota_bytes:100}]};
+    filterUsers();
+  });
+  assert.equal(await page.locator('.usage-top .pct').textContent(),'85%');
+  assert.equal(await page.locator('.usage-bar .warn').count(),1);
+  await page.goBack();
+  await page.locator('.overview-metrics').waitFor();
   const output = fileURLToPath(new URL('../artifacts/',import.meta.url));
   mkdirSync(output,{recursive:true});
   await page.screenshot({path:path.join(output,'overview-online-users.png'),fullPage:true});
@@ -214,6 +229,11 @@ try {
 
   // Auto refresh must preserve the users toolbar, focus, query and filter.
   await page.evaluate(()=>{location.hash='users';render();});
+  assert.equal(await page.locator('.user-check[data-select]').first().getAttribute('data-select'),'u1');
+  await page.locator('#user-sort').selectOption('name');
+  assert.equal(await page.locator('.user-check[data-select]').first().getAttribute('data-select'),'u0');
+  await page.evaluate(()=>load());
+  assert.equal(await page.locator('#user-sort').inputValue(),'name');
   await page.locator('#search').fill('employee');
   await page.locator('#user-filter').selectOption('online');
   await page.locator('#search').focus();
